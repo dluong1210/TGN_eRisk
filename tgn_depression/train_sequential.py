@@ -354,8 +354,6 @@ def main_worker(args,
                 val_auc_t = torch.tensor([val_auc_local], dtype=torch.float32).to(device)
                 dist.broadcast(val_auc_t, src=0)
                 val_auc = val_auc_t.item()
-            else:
-                val_auc = val_metrics.get('auc', 0)
         else:
             val_auc = val_metrics.get('auc', 0)
         
