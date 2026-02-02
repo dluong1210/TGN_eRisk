@@ -223,6 +223,8 @@ class TGNSequential(nn.Module):
             dropout=self._embedding_module_params['dropout'],
             use_memory=self._embedding_module_params['use_memory']
         )
+        # Embedding module is created lazily during forward; ensure it's on same device
+        self.embedding_module.to(self.device)
     
     def reset_state(self):
         """
