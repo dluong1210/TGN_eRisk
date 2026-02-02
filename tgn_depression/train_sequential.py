@@ -15,12 +15,18 @@ Usage:
 
 import argparse
 import logging
+import os
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset
+from torch.utils.data.distributed import DistributedSampler
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_fscore_support, accuracy_score
 
 from model.tgn_sequential import TGNSequential
@@ -30,20 +36,31 @@ from utils.data_loader import (
     load_depression_data_from_parquet_folders,
     create_dummy_data,
 )
-from utils.utils import EarlyStopMonitor, set_seed, get_device, compute_class_weights
+from utils.utils import EarlyStopMonitor, set_seed, get_device, get_device_for_rank, compute_class_weights
 
 
-def setup_logging(log_dir: str = "logs"):
-    """Setup logging configuration."""
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
-    
+class IndexDataset(Dataset):
+    """Dataset of indices for DistributedSampler (split users across GPUs)."""
+    def __init__(self, n: int):
+        self.n = n
+    def __len__(self) -> int:
+        return self.n
+    def __getitem__(self, idx: int) -> int:
+        return idx
+
+
+def setup_logging(log_dir: str = "logs", rank: int = 0):
+    """Setup logging. When rank > 0 (DDP), only StreamHandler to avoid multiple processes writing same file."""
+    if rank == 0:
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+    handlers = [logging.StreamHandler()]
+    if rank == 0:
+        handlers.append(logging.FileHandler(f'{log_dir}/train_seq_{int(time.time())}.log'))
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(f'{log_dir}/train_seq_{int(time.time())}.log'),
-            logging.StreamHandler()
-        ]
+        handlers=handlers,
+        force=True
     )
     return logging.getLogger(__name__)
 
@@ -53,63 +70,52 @@ def train_epoch(model: TGNSequential,
                 optimizer: torch.optim.Optimizer,
                 criterion: nn.Module,
                 device: torch.device,
-                n_neighbors: int = 10) -> Tuple[float, Dict]:
-    """Train for one epoch."""
+                n_neighbors: int = 10,
+                user_indices: Optional[List[int]] = None,
+                rank: int = 0,
+                world_size: int = 1) -> Tuple[float, Dict]:
+    """Train for one epoch. If user_indices is set (DDP), only process those users."""
     model.train()
+    base_model = model.module if hasattr(model, 'module') else model
     total_loss = 0
     all_preds = []
     all_labels = []
     n_users_processed = 0
     
-    for user_idx, user_data in enumerate(dataset.users):
-        # Reset state for new user
-        model.reset_state()
+    indices = user_indices if user_indices is not None else list(range(len(dataset.users)))
+    
+    for step, user_idx in enumerate(indices):
+        user_data = dataset.users[user_idx]
+        base_model.reset_state()
         
-        # Skip users with no interactions
         if user_data.total_interactions == 0:
             continue
         
-        # Forward pass
         optimizer.zero_grad()
-        
         label = torch.LongTensor([user_data.label]).to(device)
-        logits = model.forward_user(user_data, n_neighbors)
-        
-        # Compute loss
+        logits = model(user_data, n_neighbors)
         loss = criterion(logits, label)
-        
-        # Backward pass
         loss.backward()
         optimizer.step()
+        base_model.detach_memory()
         
-        # Detach memory
-        model.detach_memory()
-        
-        # Track metrics
         total_loss += loss.item()
         n_users_processed += 1
-        
-        # Get predictions
         with torch.no_grad():
             probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
             all_preds.extend(probs)
             all_labels.append(user_data.label)
         
-        # Log progress
-        if (user_idx + 1) % 50 == 0:
-            logging.info(f"  Processed {user_idx + 1}/{len(dataset.users)} users")
+        if rank == 0 and (step + 1) % 50 == 0:
+            logging.info(f"  Processed {step + 1}/{len(indices)} users (rank 0)")
     
-    # Compute metrics
     avg_loss = total_loss / max(n_users_processed, 1)
-    
     metrics = {}
     if len(all_preds) > 0:
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
         pred_labels = (all_preds > 0.5).astype(int)
-        
         metrics['accuracy'] = accuracy_score(all_labels, pred_labels)
-        
         if len(np.unique(all_labels)) > 1:
             metrics['auc'] = roc_auc_score(all_labels, all_preds)
             metrics['f1'] = f1_score(all_labels, pred_labels)
@@ -125,67 +131,72 @@ def train_epoch(model: TGNSequential,
 def evaluate(model: TGNSequential,
              dataset: DepressionDataset,
              device: torch.device,
-             n_neighbors: int = 10) -> Tuple[float, Dict]:
-    """Evaluate model on dataset."""
+             n_neighbors: int = 10,
+             user_indices: Optional[List[int]] = None) -> Tuple[float, Dict]:
+    """Evaluate model. If user_indices is set (DDP), only evaluate on those users."""
     model.eval()
+    base_model = model.module if hasattr(model, 'module') else model
     criterion = nn.CrossEntropyLoss()
-    
     total_loss = 0
     all_preds = []
     all_labels = []
     n_users_processed = 0
     
+    indices = user_indices if user_indices is not None else list(range(len(dataset.users)))
+    
     with torch.no_grad():
-        for user_data in dataset.users:
-            model.reset_state()
-            
+        for user_idx in indices:
+            user_data = dataset.users[user_idx]
+            base_model.reset_state()
             if user_data.total_interactions == 0:
                 continue
-            
             label = torch.LongTensor([user_data.label]).to(device)
-            logits = model.forward_user(user_data, n_neighbors)
-            
+            logits = model(user_data, n_neighbors)
             loss = criterion(logits, label)
             total_loss += loss.item()
             n_users_processed += 1
-            
             probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
             all_preds.extend(probs)
             all_labels.append(user_data.label)
     
     avg_loss = total_loss / max(n_users_processed, 1)
-    
     metrics = {}
+    preds_arr = np.array(all_preds) if all_preds else np.array([])
+    labels_arr = np.array(all_labels) if all_labels else np.array([])
     if len(all_preds) > 0:
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
-        pred_labels = (all_preds > 0.5).astype(int)
-        
-        metrics['accuracy'] = accuracy_score(all_labels, pred_labels)
-        
-        if len(np.unique(all_labels)) > 1:
-            metrics['auc'] = roc_auc_score(all_labels, all_preds)
-            metrics['f1'] = f1_score(all_labels, pred_labels)
+        pred_labels = (preds_arr > 0.5).astype(int)
+        metrics['accuracy'] = accuracy_score(labels_arr, pred_labels)
+        if len(np.unique(labels_arr)) > 1:
+            metrics['auc'] = roc_auc_score(labels_arr, preds_arr)
+            metrics['f1'] = f1_score(labels_arr, pred_labels)
             precision, recall, _, _ = precision_recall_fscore_support(
-                all_labels, pred_labels, average='binary', zero_division=0
+                labels_arr, pred_labels, average='binary', zero_division=0
             )
             metrics['precision'] = precision
             metrics['recall'] = recall
-    
-    return avg_loss, metrics
+    return avg_loss, metrics, preds_arr, labels_arr
 
 
-def main(args):
-    """Main training function."""
-    logger = setup_logging(args.log_dir)
-    logger.info(f"Arguments: {args}")
-    logger.info(f"Sequence mode: {args.sequence_mode.upper()}")
+def main_worker(args,
+                device: Optional[torch.device] = None,
+                rank: int = 0,
+                world_size: int = 1):
+    """Main training function. When world_size > 1, runs under DDP (device/rank set by spawn)."""
+    logger = setup_logging(args.log_dir, rank=rank)
+    if rank == 0:
+        logger.info(f"Arguments: {args}")
+        logger.info(f"Sequence mode: {args.sequence_mode.upper()}")
     
-    set_seed(args.seed)
-    device = get_device(args.gpu)
-    logger.info(f"Using device: {device}")
+    set_seed(args.seed + rank)
+    if device is None:
+        device = get_device(args.gpu)
+    if rank == 0:
+        logger.info(f"Using device: {device} (rank {rank}/{world_size})")
     
-    Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+    if rank == 0:
+        Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+    if world_size > 1:
+        dist.barrier()
     
     # Load data
     logger.info("Loading data...")
@@ -200,12 +211,13 @@ def main(args):
             save_dir=args.data_dir if args.save_dummy else None
         )
     elif getattr(args, "data_format", "csv_json") == "parquet_folders":
+        # Chỉ chia train/val, không chia tập test (test chạy riêng với run_test_parquet.py)
         train_dataset, val_dataset, test_dataset, metadata = load_depression_data_from_parquet_folders(
             data_dir=args.data_dir,
             neg_folder=args.neg_folder,
             pos_folder=args.pos_folder,
             val_ratio=0.15,
-            test_ratio=0.15,
+            test_ratio=0.0,
             split_method=args.split_method,
             seed=args.seed
         )
@@ -251,24 +263,37 @@ def main(args):
         num_classes=2
     ).to(device)
     
-    logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    if world_size > 1:
+        model = DDP(model, device_ids=[0])
     
-    # Loss and optimizer
+    if rank == 0:
+        logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.5, patience=3
     )
-    
     early_stopper = EarlyStopMonitor(max_round=args.patience, higher_better=True)
     
-    # Training loop
-    logger.info("Starting training...")
+    train_index_ds = IndexDataset(len(train_dataset.users))
+    val_index_ds = IndexDataset(len(val_dataset.users))
+    train_sampler = DistributedSampler(train_index_ds, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    val_sampler = DistributedSampler(val_index_ds, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+    
+    train_indices = list(train_sampler) if train_sampler is not None else None
+    val_indices = list(val_sampler) if val_sampler is not None else None
+    
+    if rank == 0:
+        logger.info("Starting training...")
     best_val_auc = 0
     best_epoch = 0
     
     for epoch in range(args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+            train_indices = list(train_sampler)
+        
         epoch_start = time.time()
         
         train_loss, train_metrics = train_epoch(
@@ -277,71 +302,125 @@ def main(args):
             optimizer=optimizer,
             criterion=criterion,
             device=device,
-            n_neighbors=args.n_neighbors
+            n_neighbors=args.n_neighbors,
+            user_indices=train_indices,
+            rank=rank,
+            world_size=world_size
         )
         
-        val_loss, val_metrics = evaluate(
+        val_loss, val_metrics, val_preds, val_labels = evaluate(
             model=model,
             dataset=val_dataset,
             device=device,
-            n_neighbors=args.n_neighbors
+            n_neighbors=args.n_neighbors,
+            user_indices=val_indices
         )
+        
+        if world_size > 1:
+            preds_t = torch.from_numpy(val_preds.astype(np.float32)).to(device)
+            labels_t = torch.from_numpy(val_labels.astype(np.int64)).to(device)
+            local_size = torch.tensor([preds_t.shape[0]], dtype=torch.long).to(device)
+            size_list = [torch.zeros(1, dtype=torch.long).to(device) for _ in range(world_size)]
+            dist.all_gather(size_list, local_size)
+            max_size = max(s.item() for s in size_list)
+            if max_size == 0:
+                val_metrics = {}
+                val_auc = 0.0
+            else:
+                if preds_t.shape[0] == 0:
+                    preds_t = torch.zeros(max_size, dtype=torch.float32).to(device)
+                    labels_t = torch.full((max_size,), -1, dtype=torch.int64).to(device)
+                elif preds_t.shape[0] < max_size:
+                    preds_t = torch.nn.functional.pad(preds_t, (0, max_size - preds_t.shape[0]), value=0)
+                    labels_t = torch.nn.functional.pad(labels_t, (0, max_size - labels_t.shape[0]), value=-1)
+                preds_list = [torch.zeros_like(preds_t).to(device) for _ in range(world_size)]
+                labels_list = [torch.zeros_like(labels_t).to(device) for _ in range(world_size)]
+                dist.all_gather(preds_list, preds_t)
+                dist.all_gather(labels_list, labels_t)
+                if rank == 0:
+                    all_preds = torch.cat([p[:s.item()] for p, s in zip(preds_list, size_list)], dim=0).cpu().numpy()
+                    all_labels = torch.cat([l[:s.item()] for l, s in zip(labels_list, size_list)], dim=0).cpu().numpy()
+                    valid = all_labels >= 0
+                    all_preds, all_labels = all_preds[valid], all_labels[valid]
+                    if len(all_preds) > 0 and len(np.unique(all_labels)) > 1:
+                        val_metrics = {
+                            'accuracy': accuracy_score(all_labels, (all_preds > 0.5).astype(int)),
+                            'auc': roc_auc_score(all_labels, all_preds),
+                            'f1': f1_score(all_labels, (all_preds > 0.5).astype(int))
+                        }
+                        pr, rc, _, _ = precision_recall_fscore_support(all_labels, (all_preds > 0.5).astype(int), average='binary', zero_division=0)
+                        val_metrics['precision'], val_metrics['recall'] = pr, rc
+                val_auc_local = val_metrics.get('auc', 0.0)
+                val_auc_t = torch.tensor([val_auc_local], dtype=torch.float32).to(device)
+                dist.broadcast(val_auc_t, src=0)
+                val_auc = val_auc_t.item()
+            else:
+                val_auc = val_metrics.get('auc', 0)
+        else:
+            val_auc = val_metrics.get('auc', 0)
         
         epoch_time = time.time() - epoch_start
         
-        logger.info(f"Epoch {epoch + 1}/{args.epochs} ({epoch_time:.1f}s)")
-        logger.info(f"  Train Loss: {train_loss:.4f}, Metrics: {train_metrics}")
-        logger.info(f"  Val Loss: {val_loss:.4f}, Metrics: {val_metrics}")
+        if rank == 0:
+            logger.info(f"Epoch {epoch + 1}/{args.epochs} ({epoch_time:.1f}s)")
+            logger.info(f"  Train Loss: {train_loss:.4f}, Metrics: {train_metrics}")
+            logger.info(f"  Val Loss: {val_loss:.4f}, Metrics: {val_metrics}")
         
-        val_auc = val_metrics.get('auc', 0)
         scheduler.step(val_auc)
         
         if val_auc > best_val_auc:
             best_val_auc = val_auc
             best_epoch = epoch + 1
-            torch.save(model.state_dict(), f"{args.save_dir}/best_model_{args.sequence_mode}.pth")
-            logger.info(f"  New best model saved! (AUC: {val_auc:.4f})")
+            if rank == 0:
+                save_model = model.module if hasattr(model, 'module') else model
+                torch.save(save_model.state_dict(), f"{args.save_dir}/best_model_{args.sequence_mode}.pth")
+                logger.info(f"  New best model saved! (AUC: {val_auc:.4f})")
         
         if early_stopper.early_stop_check(val_auc):
-            logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+            if rank == 0:
+                logger.info(f"Early stopping triggered after {epoch + 1} epochs")
             break
     
-    # Test
     best_path = f"{args.save_dir}/best_model_{args.sequence_mode}.pth"
-    if not Path(best_path).exists():
-        torch.save(model.state_dict(), best_path)
-        logger.info(f"No best model saved (val AUC did not improve); using last model for test.")
-    logger.info(f"\nLoading best model from epoch {best_epoch}...")
-    model.load_state_dict(torch.load(best_path))
+    if rank == 0:
+        if not Path(best_path).exists():
+            save_model = model.module if hasattr(model, 'module') else model
+            torch.save(save_model.state_dict(), best_path)
+            logger.info("No best model saved (val AUC did not improve); saved last model.")
+        logger.info(f"\nBest model saved: {best_path} (epoch {best_epoch}, val AUC: {best_val_auc:.4f})")
+        
+        import json
+        results = {
+            'sequence_mode': args.sequence_mode,
+            'best_epoch': best_epoch,
+            'best_val_auc': best_val_auc,
+            'args': vars(args)
+        }
+        with open(f"{args.save_dir}/results_{args.sequence_mode}.json", 'w') as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"Results saved to {args.save_dir}/results_{args.sequence_mode}.json")
+        logger.info("Chạy test riêng: python run_test_parquet.py <data_dir> <model_path>")
     
-    test_loss, test_metrics = evaluate(
-        model=model,
-        dataset=test_dataset,
-        device=device,
-        n_neighbors=args.n_neighbors
-    )
-    
-    logger.info("=" * 50)
-    logger.info(f"Final Test Results ({args.sequence_mode.upper()} mode):")
-    logger.info(f"  Loss: {test_loss:.4f}")
-    logger.info(f"  Metrics: {test_metrics}")
-    logger.info("=" * 50)
-    
-    # Save results
-    import json
-    results = {
-        'sequence_mode': args.sequence_mode,
-        'best_epoch': best_epoch,
-        'best_val_auc': best_val_auc,
-        'test_loss': test_loss,
-        'test_metrics': test_metrics,
-        'args': vars(args)
-    }
-    
-    with open(f"{args.save_dir}/results_{args.sequence_mode}.json", 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    logger.info(f"Results saved to {args.save_dir}/results_{args.sequence_mode}.json")
+    if world_size > 1:
+        dist.destroy_process_group()
+
+
+def worker_fn(rank: int, args, n_gpus: int, gpu_ids: List[int]):
+    """Entry point for each GPU process (DDP)."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[rank])
+    dist.init_process_group(backend="nccl", rank=rank, world_size=n_gpus)
+    device = get_device_for_rank(0, gpu_ids)
+    main_worker(args, device=device, rank=rank, world_size=n_gpus)
+
+
+def main(args):
+    """Entry point. Single-GPU or multi-GPU via spawn."""
+    if getattr(args, 'multi_gpu', False):
+        gpu_ids = [int(x) for x in args.gpu_ids.split(",")]
+        n_gpus = len(gpu_ids)
+        mp.spawn(worker_fn, args=(args, n_gpus, gpu_ids), nprocs=n_gpus, join=True)
+    else:
+        main_worker(args)
 
 
 if __name__ == "__main__":
@@ -428,7 +507,11 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--gpu', type=int, default=0,
-                        help='GPU index')
+                        help='GPU index (single-GPU mode)')
+    parser.add_argument('--multi_gpu', action='store_true',
+                        help='Train on multiple GPUs (DDP)')
+    parser.add_argument('--gpu_ids', type=str, default='0,1',
+                        help='Comma-separated GPU IDs for multi-GPU (e.g. 0,1 for 2x T4)')
     
     # Output arguments
     parser.add_argument('--save_dir', type=str, default='./saved_models',

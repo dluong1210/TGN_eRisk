@@ -511,15 +511,24 @@ def load_depression_data_from_parquet_folders(
     
     print(f"  Created {len(all_user_data)} target user samples")
     
-    # Split (đảm bảo ít nhất 1 val, 1 test khi có đủ mẫu)
+    # Split: test_ratio=0 → chỉ train/val; val_ratio=0 & test_ratio=0 → toàn bộ là train (để dùng làm test set)
     n_total = len(all_user_data)
-    n_test = max(1, int(n_total * test_ratio)) if n_total >= 3 else 0
-    n_val = max(1, int(n_total * val_ratio)) if n_total >= 2 else 0
-    n_train = n_total - n_val - n_test
-    if n_train < 0:
-        n_train = n_total - 2
-        n_val = 1
-        n_test = 1
+    if test_ratio <= 0 and val_ratio <= 0:
+        n_test = 0
+        n_val = 0
+        n_train = n_total
+    elif test_ratio <= 0:
+        n_test = 0
+        n_val = max(1, int(n_total * val_ratio)) if n_total >= 2 else 0
+        n_train = n_total - n_val
+    else:
+        n_test = max(1, int(n_total * test_ratio)) if n_total >= 3 else 0
+        n_val = max(1, int(n_total * val_ratio)) if n_total >= 2 else 0
+        n_train = n_total - n_val - n_test
+        if n_train < 0:
+            n_train = n_total - 2
+            n_val = 1
+            n_test = 1
     
     rng = np.random.RandomState(seed)
     labels_arr = np.array([u.label for u in all_user_data])
@@ -528,18 +537,23 @@ def load_depression_data_from_parquet_folders(
     if split_method == "stratified":
         train_idx, temp_idx = _stratified_split(indices, labels_arr, n_train / n_total, rng)
         temp_idx = np.asarray(temp_idx, dtype=np.intp)
-        val_ratio_rest = n_val / len(temp_idx) if len(temp_idx) > 0 else 0.5
-        val_idx, test_idx = _stratified_split(temp_idx, labels_arr[temp_idx], val_ratio_rest, rng)
+        if n_test > 0 and len(temp_idx) > 0:
+            val_ratio_rest = n_val / len(temp_idx)
+            val_idx, test_idx = _stratified_split(temp_idx, labels_arr[temp_idx], val_ratio_rest, rng)
+            test_users = [all_user_data[i] for i in test_idx]
+        else:
+            val_idx = temp_idx
+            test_idx = np.array([], dtype=np.intp)
+            test_users = []
         train_users = [all_user_data[i] for i in train_idx]
         val_users = [all_user_data[i] for i in val_idx]
-        test_users = [all_user_data[i] for i in test_idx]
     else:
         perm = rng.permutation(n_total)
         train_users = [all_user_data[i] for i in perm[:n_train]]
         val_users = [all_user_data[i] for i in perm[n_train:n_train + n_val]]
-        test_users = [all_user_data[i] for i in perm[n_train + n_val:]]
+        test_users = [all_user_data[i] for i in perm[n_train + n_val:n_train + n_val + n_test]]
     
-    print(f"  Split ({split_method}): {len(train_users)} train, {len(val_users)} val, {len(test_users)} test")
+    print(f"  Split ({split_method}): {len(train_users)} train, {len(val_users)} val" + (f", {len(test_users)} test" if test_users else " (no test)"))
     
     train_dataset = DepressionDataset(
         users=train_users,

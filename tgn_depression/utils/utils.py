@@ -26,6 +26,19 @@ def get_device(gpu_id: int = 0) -> torch.device:
     return torch.device('cpu')
 
 
+def get_device_for_rank(local_rank: int, gpu_ids: list) -> torch.device:
+    """
+    Get device for current process in multi-GPU (DDP) training.
+    Use when each process has CUDA_VISIBLE_DEVICES set to a single GPU;
+    then cuda:0 is the correct device for this process.
+    """
+    if not torch.cuda.is_available():
+        return torch.device('cpu')
+    # When using spawn with gpu_ids, we set CUDA_VISIBLE_DEVICES per process,
+    # so the only visible GPU is cuda:0 in this process.
+    return torch.device('cuda:0')
+
+
 def compute_class_weights(labels: np.ndarray) -> torch.Tensor:
     """
     Compute class weights for imbalanced data.

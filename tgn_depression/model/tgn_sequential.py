@@ -547,16 +547,22 @@ class TGNSequential(nn.Module):
         
         return self.classifier(final_hidden)
     
+    def forward(self, user_data, n_neighbors: int = None) -> torch.Tensor:
+        """
+        Forward pass (used by DDP / DataParallel). Delegates to forward_user.
+        """
+        return self.forward_user(user_data, n_neighbors)
+
     def forward_user(self,
                      user_data,
                      n_neighbors: int = None) -> torch.Tensor:
         """
         Main forward pass - dispatches to appropriate mode.
-        
+
         Args:
             user_data: UserData object
             n_neighbors: Number of neighbors
-        
+
         Returns:
             Logits [1, num_classes]
         """

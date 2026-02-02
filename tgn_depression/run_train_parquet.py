@@ -41,6 +41,8 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--multi_gpu", action="store_true", help="Train trên 2 GPU (DDP)")
+    parser.add_argument("--gpu_ids", type=str, default="0,1", help="GPU IDs khi dùng --multi_gpu (vd: 0,1)")
     parser.add_argument("--save_dir", type=str, default="./saved_models")
     parser.add_argument("--log_dir", type=str, default="./logs")
     parser.add_argument("--lstm_hidden_dim", type=int, default=128)
@@ -99,6 +101,8 @@ def build_train_args(args):
         patience=args.patience,
         seed=args.seed,
         gpu=args.gpu,
+        multi_gpu=args.multi_gpu,
+        gpu_ids=args.gpu_ids,
         save_dir=args.save_dir,
         log_dir=args.log_dir,
     )
