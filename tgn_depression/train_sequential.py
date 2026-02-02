@@ -406,6 +406,8 @@ def main_worker(args,
 def worker_fn(rank: int, args, n_gpus: int, gpu_ids: List[int]):
     """Entry point for each GPU process (DDP)."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[rank])
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
     dist.init_process_group(backend="nccl", rank=rank, world_size=n_gpus)
     device = get_device_for_rank(0, gpu_ids)
     main_worker(args, device=device, rank=rank, world_size=n_gpus)
