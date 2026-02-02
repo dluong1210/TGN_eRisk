@@ -2,8 +2,15 @@
 Training script for TGN Sequential models (CarryOver and LSTM).
 
 Usage:
+    # Dummy data
     python train_sequential.py --sequence_mode carryover --use_dummy_data
-    python train_sequential.py --sequence_mode lstm --data_dir ./data
+
+    # Parquet folders (neg/ + pos/, tên file = target_user)
+    python train_sequential.py --data_format parquet_folders --data_dir /path/to/parent_of_neg_pos
+    # Hoặc dùng script gọn: python run_train_parquet.py /path/to/parent_of_neg_pos
+
+    # CSV + JSON
+    python train_sequential.py --data_dir ./data --data_format csv_json
 """
 
 import argparse

@@ -109,25 +109,55 @@ Pre-computed BERT embeddings của posts, organized by target user.
 python train.py --use_dummy_data --epochs 10
 ```
 
-### Training with Real Data
+### Training với data parquet (eRisk / Kaggle)
+
+Data gồm 2 folder **neg/** (label 0) và **pos/** (label 1). Mỗi file `.parquet` = 1 target user (tên file = target_user). Parquet có cột: `userID`, `parentID`, `timestamp`, `post_id`, `conversation_id`, `embedding`.
+
+Ví dụ đường dẫn Kaggle:
+- `neg`: `/kaggle/input/erisk-post-embedding-mapped/eRisk2022_mapped/neg`
+- `pos`: `/kaggle/input/erisk-post-embedding-mapped/eRisk2022_mapped/pos`
+
+**Cách 1 – Script (tham số là đường dẫn data):**
+
+```bash
+cd tgn_depression
+python run_train_parquet.py /kaggle/input/erisk-post-embedding-mapped/eRisk2022_mapped
+```
+
+Với tham số thêm:
+
+```bash
+python run_train_parquet.py /kaggle/input/erisk-post-embedding-mapped/eRisk2022_mapped \
+  --sequence_mode lstm --epochs 30 --patience 5 --neg_folder neg --pos_folder pos
+```
+
+**Cách 2 – train_sequential.py:**
+
+```bash
+python train_sequential.py \
+  --data_format parquet_folders \
+  --data_dir /kaggle/input/erisk-post-embedding-mapped/eRisk2022_mapped \
+  --neg_folder neg --pos_folder pos \
+  --sequence_mode carryover --epochs 50
+```
+
+**Notebook:** Mở `train_erisk.ipynb` ở root repo, đặt `DATA_DIR` rồi chạy các cell.
+
+### Training with Real Data (CSV + JSON)
 
 Đặt các file vào thư mục data:
 - `data/interactions.csv`
 - `data/embeddings.json`
 - `data/labels.json`
 
-Split mặc định: `--split_method stratified` (giữ tỉ lệ depression/non-depression trong train/val/test). Có thể dùng `--split_method random`.
+Split mặc định: `--split_method stratified`. Có thể dùng `--split_method random`.
 
 ```bash
-python train.py \
+python train_sequential.py \
     --data_dir ./data \
+    --data_format csv_json \
     --epochs 50 \
-    --n_layers 1 \
-    --n_heads 2 \
-    --memory_dim 768 \
-    --n_neighbors 10 \
-    --lr 0.0001 \
-    --patience 5
+    --sequence_mode carryover
 ```
 
 ### Command Line Arguments
