@@ -412,15 +412,18 @@ def load_depression_data_from_parquet_folders(
     post_id_to_idx = {pid: i for i, pid in enumerate(post_ids_sorted)}
     idx_to_post_id = {i: pid for pid, i in post_id_to_idx.items()}
     n_posts = len(post_ids_sorted)
-    flat_list = [post_id_to_embedding[pid].flatten() for pid in post_ids_sorted]
-    embedding_dim = int(max(e.size for e in flat_list))
+    embedding_dim = 0
+    for pid in post_ids_sorted:
+        arr = np.asarray(post_id_to_embedding[pid], dtype=np.float32).reshape(-1)
+        embedding_dim = max(embedding_dim, arr.size)
     post_embeddings = np.zeros((n_posts, embedding_dim), dtype=np.float32)
-    for i, emb in enumerate(flat_list):
-        d = emb.size
+    for i, pid in enumerate(post_ids_sorted):
+        arr = np.asarray(post_id_to_embedding[pid], dtype=np.float32).reshape(-1)
+        d = arr.size
         if d >= embedding_dim:
-            post_embeddings[i] = emb[:embedding_dim]
+            post_embeddings[i] = arr[:embedding_dim]
         else:
-            post_embeddings[i, :d] = emb
+            post_embeddings[i, :d] = arr
     print(f"  Total users: {n_total_users}, posts: {n_posts}, embedding_dim: {embedding_dim}")
     
     # Pass 2: Build UserData cho mỗi parquet
