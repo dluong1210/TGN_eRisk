@@ -18,7 +18,11 @@ from sklearn.metrics import roc_auc_score, f1_score, precision_recall_fscore_sup
 
 from model.tgn_sequential import TGNSequential
 from utils.data_structures import UserData, DepressionDataset
-from utils.data_loader import load_depression_data, create_dummy_data
+from utils.data_loader import (
+    load_depression_data,
+    load_depression_data_from_parquet_folders,
+    create_dummy_data,
+)
 from utils.utils import EarlyStopMonitor, set_seed, get_device, compute_class_weights
 
 
@@ -188,6 +192,16 @@ def main(args):
             depression_ratio=0.3,
             save_dir=args.data_dir if args.save_dummy else None
         )
+    elif getattr(args, "data_format", "csv_json") == "parquet_folders":
+        train_dataset, val_dataset, test_dataset, metadata = load_depression_data_from_parquet_folders(
+            data_dir=args.data_dir,
+            neg_folder=args.neg_folder,
+            pos_folder=args.pos_folder,
+            val_ratio=0.15,
+            test_ratio=0.15,
+            split_method=args.split_method,
+            seed=args.seed
+        )
     else:
         train_dataset, val_dataset, test_dataset, metadata = load_depression_data(
             interactions_path=f"{args.data_dir}/interactions.csv",
@@ -202,7 +216,7 @@ def main(args):
     
     # Compute class weights
     train_labels = np.array([u.label for u in train_dataset.users])
-    class_weights = compute_class_weights(train_labels).to(device)
+    class_weights = compute_class_weights(train_labels).to(device).float()
     logger.info(f"Class weights: {class_weights}")
     
     # Initialize model
@@ -237,7 +251,7 @@ def main(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=3, verbose=True
+        optimizer, mode='max', factor=0.5, patience=3
     )
     
     early_stopper = EarlyStopMonitor(max_round=args.patience, higher_better=True)
@@ -286,8 +300,12 @@ def main(args):
             break
     
     # Test
+    best_path = f"{args.save_dir}/best_model_{args.sequence_mode}.pth"
+    if not Path(best_path).exists():
+        torch.save(model.state_dict(), best_path)
+        logger.info(f"No best model saved (val AUC did not improve); using last model for test.")
     logger.info(f"\nLoading best model from epoch {best_epoch}...")
-    model.load_state_dict(torch.load(f"{args.save_dir}/best_model_{args.sequence_mode}.pth"))
+    model.load_state_dict(torch.load(best_path))
     
     test_loss, test_metrics = evaluate(
         model=model,
@@ -337,7 +355,14 @@ if __name__ == "__main__":
     
     # Data arguments
     parser.add_argument('--data_dir', type=str, default='./data',
-                        help='Directory containing data files')
+                        help='Directory containing data files (or parent of neg/pos for parquet_folders)')
+    parser.add_argument('--data_format', type=str, default='csv_json',
+                        choices=['csv_json', 'parquet_folders'],
+                        help='Data format: csv_json (interactions.csv + embeddings.json + labels.json) or parquet_folders (neg/ + pos/)')
+    parser.add_argument('--neg_folder', type=str, default='neg',
+                        help='Folder name for label 0 (parquet_folders only)')
+    parser.add_argument('--pos_folder', type=str, default='pos',
+                        help='Folder name for label 1 (parquet_folders only)')
     parser.add_argument('--use_dummy_data', action='store_true',
                         help='Use generated dummy data for testing')
     parser.add_argument('--save_dummy', action='store_true',

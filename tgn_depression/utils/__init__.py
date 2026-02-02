@@ -6,7 +6,7 @@ try:
         DepressionDataset,
         collate_users
     )
-    from .data_loader import load_depression_data, create_dummy_data
+    from .data_loader import load_depression_data, load_depression_data_from_parquet_folders, create_dummy_data
     from .neighbor_finder import NeighborFinder, get_neighbor_finder, ConversationNeighborFinder
     from .utils import (
         EarlyStopMonitor,
@@ -23,7 +23,7 @@ except ImportError:
         DepressionDataset,
         collate_users
     )
-    from data_loader import load_depression_data, create_dummy_data
+    from data_loader import load_depression_data, load_depression_data_from_parquet_folders, create_dummy_data
     from neighbor_finder import NeighborFinder, get_neighbor_finder, ConversationNeighborFinder
     from utils import (
         EarlyStopMonitor,

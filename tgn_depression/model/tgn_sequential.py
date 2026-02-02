@@ -423,6 +423,7 @@ class TGNSequential(nn.Module):
             return self.classifier(zero_emb)
         
         # Process each conversation sequentially
+        last_embedding = None
         for conv in conversations:
             if conv.n_interactions == 0:
                 continue
@@ -436,16 +437,21 @@ class TGNSequential(nn.Module):
             )
             
             # ===== CARRY-OVER: Update node features cho target user =====
-            # Embedding này sẽ được dùng làm khởi tạo cho conversation tiếp theo
+            # Embedding này sẽ được dùng làm khởi tạo cho conversation tiếp theo.
+            # .detach() khi ghi buffer để tránh giữ computation graph qua nhiều conversation.
             self.node_features[target_user] = user_embedding.squeeze(0).detach()
+            
+            last_embedding = user_embedding  # Giữ để classify từ tensor có grad
             
             # Reset memory cho conversation mới (giữ node_features đã update)
             if self.use_memory:
                 self.memory.__init_memory__()
         
-        # Final embedding (đã được cập nhật qua các conversations)
-        # Sử dụng node_features hiện tại của target user
-        final_embedding = self.node_features[target_user].unsqueeze(0)
+        # Final embedding: dùng embedding của conversation cuối (có grad) để classify
+        if last_embedding is not None:
+            final_embedding = last_embedding
+        else:
+            final_embedding = self.node_features[target_user].unsqueeze(0)
         
         return self.classifier(final_embedding)
     

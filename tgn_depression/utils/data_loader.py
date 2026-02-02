@@ -1,10 +1,15 @@
 """
 Data loading utilities for TGN Depression Detection.
 
-Data format:
+Data format (option 1 - CSV + JSON):
 - CSV file: userID, parentID, timestamp, post_id, conversation_id
 - JSON embeddings: {"target_user_id": {"post_id": [embedding_vector]}}
 - JSON labels: {"target_user_id": 0 or 1}
+
+Data format (option 2 - Parquet folders):
+- data_dir/neg/  (label 0) và data_dir/pos/  (label 1)
+- Mỗi folder chứa các file .parquet, tên file = target user id
+- Mỗi parquet: userID, parentID, timestamp, post_id, conversation_id, embedding
 """
 
 import numpy as np
@@ -297,6 +302,238 @@ def load_depression_data(
         idx_to_user=idx_to_user
     )
     
+    test_dataset = DepressionDataset(
+        users=test_users,
+        post_embeddings=post_embeddings,
+        n_total_users=n_total_users,
+        user_to_idx=user_to_idx,
+        idx_to_user=idx_to_user
+    )
+    
+    metadata = {
+        'n_total_users': n_total_users,
+        'n_target_users': len(all_user_data),
+        'n_posts': n_posts,
+        'embedding_dim': embedding_dim,
+        'user_to_idx': user_to_idx,
+        'idx_to_user': idx_to_user,
+        'post_id_to_idx': post_id_to_idx,
+        'idx_to_post_id': idx_to_post_id
+    }
+    
+    return train_dataset, val_dataset, test_dataset, metadata
+
+
+def load_depression_data_from_parquet_folders(
+    data_dir: str,
+    neg_folder: str = "neg",
+    pos_folder: str = "pos",
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    split_method: str = "stratified",
+    seed: int = 42
+) -> Tuple[DepressionDataset, DepressionDataset, DepressionDataset, Dict]:
+    """
+    Load data từ 2 folder neg (label 0) và pos (label 1).
+    
+    Mỗi folder chứa các file .parquet; tên file (stem) = target user id.
+    Mỗi parquet: userID, parentID, timestamp, post_id, conversation_id, embedding.
+    
+    Args:
+        data_dir: Thư mục gốc chứa neg/ và pos/
+        neg_folder: Tên folder cho label 0 (mặc định "neg")
+        pos_folder: Tên folder cho label 1 (mặc định "pos")
+        val_ratio, test_ratio: Tỉ lệ val/test
+        split_method: 'stratified' hoặc 'random'
+        seed: Random seed
+    
+    Returns:
+        train_dataset, val_dataset, test_dataset, metadata
+    """
+    data_dir = Path(data_dir)
+    neg_path = data_dir / neg_folder
+    pos_path = data_dir / pos_folder
+    
+    if not neg_path.exists():
+        raise FileNotFoundError(f"Folder not found: {neg_path}")
+    if not pos_path.exists():
+        raise FileNotFoundError(f"Folder not found: {pos_path}")
+    
+    print("Loading data from parquet folders...")
+    
+    # Thu thập tất cả parquet paths và labels
+    parquet_files: List[Tuple[Path, int]] = []
+    for p in neg_path.glob("*.parquet"):
+        parquet_files.append((p, 0))
+    for p in pos_path.glob("*.parquet"):
+        parquet_files.append((p, 1))
+    
+    if len(parquet_files) == 0:
+        raise ValueError(f"No .parquet files found in {neg_path} or {pos_path}")
+    
+    print(f"  Found {len(parquet_files)} parquet files")
+    
+    # Pass 1: Thu thập tất cả users và (post_id, embedding)
+    all_users: set = set()
+    post_id_to_embedding: Dict[str, np.ndarray] = {}
+    
+    for parquet_path, _ in parquet_files:
+        df = pd.read_parquet(parquet_path)
+        # Cột: userID, parentID, timestamp, post_id, conversation_id, embedding
+        for col in ["userID", "parentID", "timestamp", "post_id", "conversation_id", "embedding"]:
+            if col not in df.columns:
+                raise ValueError(f"Missing column '{col}' in {parquet_path}")
+        
+        for _, row in df.iterrows():
+            if pd.isna(row["userID"]):
+                continue
+            uid = str(row["userID"])
+            all_users.add(uid)
+            pid = row["parentID"]
+            if pd.notna(pid):
+                all_users.add(str(pid))
+            
+            post_id = str(row["post_id"])
+            if post_id not in post_id_to_embedding:
+                emb = row["embedding"]
+                if hasattr(emb, "tolist"):
+                    emb = np.array(emb, dtype=np.float32)
+                else:
+                    emb = np.array(emb, dtype=np.float32)
+                post_id_to_embedding[post_id] = emb
+    
+    # User mappings
+    user_to_idx = {u: i for i, u in enumerate(sorted(all_users))}
+    idx_to_user = {i: u for u, i in user_to_idx.items()}
+    n_total_users = len(user_to_idx)
+    
+    # Post embeddings matrix
+    post_ids_sorted = sorted(post_id_to_embedding.keys())
+    post_id_to_idx = {pid: i for i, pid in enumerate(post_ids_sorted)}
+    idx_to_post_id = {i: pid for pid, i in post_id_to_idx.items()}
+    embedding_dim = post_id_to_embedding[post_ids_sorted[0]].shape[0]
+    post_embeddings = np.stack([post_id_to_embedding[pid] for pid in post_ids_sorted], axis=0).astype(np.float32)
+    n_posts = len(post_ids_sorted)
+    
+    print(f"  Total users: {n_total_users}, posts: {n_posts}, embedding_dim: {embedding_dim}")
+    
+    # Pass 2: Build UserData cho mỗi parquet
+    all_user_data: List[UserData] = []
+    
+    for parquet_path, label in parquet_files:
+        target_user_id_str = parquet_path.stem
+        df = pd.read_parquet(parquet_path)
+        
+        # Đảm bảo target user có trong user_to_idx (có thể chưa xuất hiện trong interactions)
+        if target_user_id_str not in user_to_idx:
+            user_to_idx[target_user_id_str] = n_total_users
+            idx_to_user[n_total_users] = target_user_id_str
+            n_total_users += 1
+        
+        user_idx = user_to_idx[target_user_id_str]
+        
+        # Bỏ dòng không có parentID (root post) hoặc userID
+        df = df[df["parentID"].notna() & df["userID"].notna()].copy()
+        if len(df) == 0:
+            all_user_data.append(UserData(
+                user_id=user_idx,
+                user_id_str=target_user_id_str,
+                conversations=[],
+                label=label
+            ))
+            continue
+        
+        # Group by conversation_id
+        conversations_list: List[Conversation] = []
+        for conv_id, group in df.groupby("conversation_id"):
+            group = group.sort_values("timestamp").reset_index(drop=True)
+            rows_valid = []
+            for _, row in group.iterrows():
+                uid_str = str(row["userID"])
+                pid_str = str(row["parentID"])
+                if uid_str not in user_to_idx or pid_str not in user_to_idx:
+                    continue
+                post_id_str = str(row["post_id"])
+                post_idx = post_id_to_idx.get(post_id_str, 0)
+                rows_valid.append((
+                    user_to_idx[uid_str],
+                    user_to_idx[pid_str],
+                    float(row["timestamp"]),
+                    post_idx
+                ))
+            if len(rows_valid) == 0:
+                continue
+            
+            source_users = np.array([r[0] for r in rows_valid], dtype=np.int64)
+            dest_users = np.array([r[1] for r in rows_valid], dtype=np.int64)
+            timestamps = np.array([r[2] for r in rows_valid], dtype=np.float64)
+            post_ids = np.array([r[3] for r in rows_valid], dtype=np.int64)
+            
+            conv = Conversation(
+                conversation_id=str(conv_id),
+                source_users=source_users,
+                dest_users=dest_users,
+                timestamps=timestamps,
+                post_ids=post_ids
+            )
+            conversations_list.append(conv)
+        
+        conversations_list = sorted(conversations_list, key=lambda c: c.start_time)
+        
+        user_data = UserData(
+            user_id=user_idx,
+            user_id_str=target_user_id_str,
+            conversations=conversations_list,
+            label=label
+        )
+        all_user_data.append(user_data)
+    
+    print(f"  Created {len(all_user_data)} target user samples")
+    
+    # Split (đảm bảo ít nhất 1 val, 1 test khi có đủ mẫu)
+    n_total = len(all_user_data)
+    n_test = max(1, int(n_total * test_ratio)) if n_total >= 3 else 0
+    n_val = max(1, int(n_total * val_ratio)) if n_total >= 2 else 0
+    n_train = n_total - n_val - n_test
+    if n_train < 0:
+        n_train = n_total - 2
+        n_val = 1
+        n_test = 1
+    
+    rng = np.random.RandomState(seed)
+    labels_arr = np.array([u.label for u in all_user_data])
+    indices = np.arange(n_total)
+    
+    if split_method == "stratified":
+        train_idx, temp_idx = _stratified_split(indices, labels_arr, n_train / n_total, rng)
+        temp_idx = np.asarray(temp_idx, dtype=np.intp)
+        val_ratio_rest = n_val / len(temp_idx) if len(temp_idx) > 0 else 0.5
+        val_idx, test_idx = _stratified_split(temp_idx, labels_arr[temp_idx], val_ratio_rest, rng)
+        train_users = [all_user_data[i] for i in train_idx]
+        val_users = [all_user_data[i] for i in val_idx]
+        test_users = [all_user_data[i] for i in test_idx]
+    else:
+        perm = rng.permutation(n_total)
+        train_users = [all_user_data[i] for i in perm[:n_train]]
+        val_users = [all_user_data[i] for i in perm[n_train:n_train + n_val]]
+        test_users = [all_user_data[i] for i in perm[n_train + n_val:]]
+    
+    print(f"  Split ({split_method}): {len(train_users)} train, {len(val_users)} val, {len(test_users)} test")
+    
+    train_dataset = DepressionDataset(
+        users=train_users,
+        post_embeddings=post_embeddings,
+        n_total_users=n_total_users,
+        user_to_idx=user_to_idx,
+        idx_to_user=idx_to_user
+    )
+    val_dataset = DepressionDataset(
+        users=val_users,
+        post_embeddings=post_embeddings,
+        n_total_users=n_total_users,
+        user_to_idx=user_to_idx,
+        idx_to_user=idx_to_user
+    )
     test_dataset = DepressionDataset(
         users=test_users,
         post_embeddings=post_embeddings,
