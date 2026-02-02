@@ -400,7 +400,7 @@ def load_depression_data_from_parquet_folders(
                     emb = np.array(emb, dtype=np.float32)
                 else:
                     emb = np.array(emb, dtype=np.float32)
-                post_id_to_embedding[post_id] = emb
+                post_id_to_embedding[post_id] = emb.flatten()
     
     # User mappings
     user_to_idx = {u: i for i, u in enumerate(sorted(all_users))}
@@ -411,8 +411,10 @@ def load_depression_data_from_parquet_folders(
     post_ids_sorted = sorted(post_id_to_embedding.keys())
     post_id_to_idx = {pid: i for i, pid in enumerate(post_ids_sorted)}
     idx_to_post_id = {i: pid for pid, i in post_id_to_idx.items()}
-    embedding_dim = post_id_to_embedding[post_ids_sorted[0]].shape[0]
-    post_embeddings = np.stack([post_id_to_embedding[pid] for pid in post_ids_sorted], axis=0).astype(np.float32)
+    embedding_dim = int(post_id_to_embedding[post_ids_sorted[0]].size)
+    post_embeddings = np.stack(
+        [post_id_to_embedding[pid].flatten() for pid in post_ids_sorted], axis=0
+    ).astype(np.float32)
     n_posts = len(post_ids_sorted)
     
     print(f"  Total users: {n_total_users}, posts: {n_posts}, embedding_dim: {embedding_dim}")
