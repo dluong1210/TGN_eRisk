@@ -25,6 +25,23 @@ except ImportError:
     from data_structures import Conversation, UserData, DepressionDataset
 
 
+def _embedding_to_1d(emb):
+    """Convert embedding (list/array, possibly nested) to 1D np.float32 without np.stack on ragged data."""
+    if emb is None or (isinstance(emb, float) and np.isnan(emb)):
+        return np.array([], dtype=np.float32)
+    flat = []
+
+    def _flatten(x):
+        if hasattr(x, "__iter__") and not isinstance(x, (str, bytes)):
+            for y in x:
+                _flatten(y)
+        else:
+            flat.append(float(x))
+
+    _flatten(emb)
+    return np.array(flat, dtype=np.float32)
+
+
 def _stratified_split(
     indices: np.ndarray,
     labels: np.ndarray,
@@ -395,12 +412,7 @@ def load_depression_data_from_parquet_folders(
             
             post_id = str(row["post_id"])
             if post_id not in post_id_to_embedding:
-                emb = row["embedding"]
-                if hasattr(emb, "tolist"):
-                    emb = np.array(emb, dtype=np.float32)
-                else:
-                    emb = np.array(emb, dtype=np.float32)
-                post_id_to_embedding[post_id] = emb.flatten()
+                post_id_to_embedding[post_id] = _embedding_to_1d(row["embedding"])
     
     # User mappings
     user_to_idx = {u: i for i, u in enumerate(sorted(all_users))}
