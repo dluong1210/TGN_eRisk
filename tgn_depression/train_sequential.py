@@ -264,7 +264,7 @@ def main_worker(args,
     ).to(device)
     
     if world_size > 1:
-        model = DDP(model, device_ids=[0])
+        model = DDP(model, device_ids=[0], find_unused_parameters=True)
     
     if rank == 0:
         logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
