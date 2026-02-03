@@ -126,17 +126,12 @@ class Memory(nn.Module):
     
     def detach_memory(self):
         """
-        Detach memory from computation graph.
-        Called after backprop to prevent gradient accumulation.
+        Detach memory from computation graph and clear message buffers.
+        Called after backprop to prevent gradient accumulation and free VRAM.
         """
         self.memory.detach_()
-        
-        # Detach all stored messages
-        for k, v in self.messages.items():
-            new_messages = []
-            for message, timestamp in v:
-                new_messages.append((message.detach(), timestamp))
-            self.messages[k] = new_messages
+        # Xóa hết messages để giải phóng tham chiếu tới tensor (tránh tràn VRAM)
+        self.messages = defaultdict(list)
     
     def reset_state(self):
         """Reset memory state (alias for __init_memory__)."""

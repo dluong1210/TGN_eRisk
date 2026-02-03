@@ -99,61 +99,36 @@ def train_epoch(model: TGNSequential,
         
         optimizer.zero_grad()
         
-        # Lấy user_data cho batch (tensor trên device trực tiếp, tránh .to(device))
-        batch_users_data = [dataset.users[user_idx] for user_idx in batch_indices]
-        batch_labels = torch.tensor(
-            [dataset.users[user_idx].label for user_idx in batch_indices],
-            dtype=torch.long, device=device
-        )
-        
-        # Forward batch users (chỉ LSTM mode)
-        if use_batch_forward and base_model.sequence_mode == 'lstm' and len(batch_indices) > 1:
-            # Xử lý batch users (forward_batch_users sẽ reset state cho mỗi user)
-            logits = base_model.forward_batch_users(
-                batch_users_data, n_neighbors,
-                use_parallel_conversations=use_parallel_conversations,
-                max_workers=max_workers
-            )
-            # CrossEntropyLoss tự động tính trung bình trên batch, không cần normalize
-            loss = criterion(logits, batch_labels)
-            loss.backward()
-            
-            # Detach memory sau khi backward
+        # Luôn xử lý từng user (không dùng forward_batch_users) để tránh giữ nhiều computation
+        # graph cùng lúc -> VRAM tăng / OOM. Gradient được accumulate qua từng user rồi step 1 lần.
+        n_in_batch = len(batch_indices)
+        batch_probs = []
+        batch_labels_list = []
+        for user_idx in batch_indices:
+            user_data = dataset.users[user_idx]
+            base_model.reset_state()
+            logits = model(user_data, n_neighbors)
+            batch_labels_list.append(user_data.label)
+            loss = criterion(logits, torch.tensor([user_data.label], dtype=torch.long, device=device))
+            # Scale loss để gradient accumulate = mean over batch (giống CrossEntropyLoss trung bình)
+            (loss / n_in_batch).backward()
             base_model.detach_memory()
-            
-            # Loss đã là trung bình, nên nhân với batch_size để có total loss
-            total_loss += loss.item() * len(batch_indices)
-            n_users_processed += len(batch_indices)
-            # Một lần softmax + cpu (nhanh hơn); xong thì giải phóng logits để tránh giữ graph
+            total_loss += loss.item()
+            n_users_processed += 1
+            # Lấy prob ngay, chuyển CPU, không giữ logits để giải phóng graph
             with torch.inference_mode():
-                probs = torch.softmax(logits, dim=1)[:, 1]
-                all_preds.append(probs.cpu().numpy().copy())
-                all_labels.append(batch_labels.cpu().numpy().copy())
-            del logits, probs
-        else:
-            # Xử lý từng user: không giữ logits (tránh giữ computation graph -> VRAM tăng/OOM)
-            batch_probs = []
-            batch_labels_list = []
-            for user_idx in batch_indices:
-                user_data = dataset.users[user_idx]
-                base_model.reset_state()
-                logits = model(user_data, n_neighbors)
-                batch_labels_list.append(user_data.label)
-                loss = criterion(logits, torch.tensor([user_data.label], dtype=torch.long, device=device))
-                loss.backward()
-                base_model.detach_memory()
-                total_loss += loss.item()
-                n_users_processed += 1
-                # Lấy prob ngay, chuyển CPU, không giữ logits để giải phóng graph
-                with torch.inference_mode():
-                    p = torch.softmax(logits, dim=1)[0, 1].detach().cpu().numpy().item()
-                batch_probs.append(p)
-            if batch_probs:
-                all_preds.append(np.array(batch_probs, dtype=np.float32))
-                all_labels.append(np.array(batch_labels_list, dtype=np.int64))
+                p = torch.softmax(logits, dim=1)[0, 1].detach().cpu().numpy().item()
+            batch_probs.append(p)
+        if batch_probs:
+            all_preds.append(np.array(batch_probs, dtype=np.float32))
+            all_labels.append(np.array(batch_labels_list, dtype=np.int64))
         
         # Update optimizer sau khi xử lý xong một batch user
         optimizer.step()
+        
+        # Định kỳ giải phóng cache GPU để tránh phân mảnh / tràn VRAM
+        if device.type == "cuda" and (batch_start // user_batch_size + 1) % 50 == 0:
+            torch.cuda.empty_cache()
         
         if rank == 0 and ((batch_start // user_batch_size) + 1) % 100 == 0:
             logging.info(f"  Processed {batch_start + len(batch_indices)}/{len(indices)} users (rank 0)")
@@ -183,29 +158,48 @@ def evaluate(model: TGNSequential,
              dataset: DepressionDataset,
              device: torch.device,
              n_neighbors: int = 10,
-             user_indices: Optional[List[int]] = None) -> Tuple[float, Dict, np.ndarray, np.ndarray]:
-    """Evaluate model. If user_indices is set (DDP), only evaluate on those users."""
+             user_indices: Optional[List[int]] = None,
+             eval_batch_size: int = 1) -> Tuple[float, Dict, np.ndarray, np.ndarray]:
+    """Evaluate model. If user_indices is set (DDP), only evaluate on those users.
+    eval_batch_size > 1 (LSTM mode) gom nhiều user một forward để eval nhanh hơn."""
     model.eval()
     base_model = model.module if hasattr(model, 'module') else model
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
     indices = user_indices if user_indices is not None else list(range(len(dataset.users)))
     n_indices = len(indices)
-    # Pre-allocate (tránh list extend + một lần numpy)
     preds_arr = np.empty(n_indices, dtype=np.float32)
     labels_arr = np.empty(n_indices, dtype=np.int64)
-    
+    use_batch_eval = (
+        eval_batch_size > 1
+        and base_model.sequence_mode == 'lstm'
+        and n_indices > 1
+    )
+    eval_batch_size = min(eval_batch_size, n_indices) if use_batch_eval else 1
+
     with torch.inference_mode():
-        for i, user_idx in enumerate(indices):
-            user_data = dataset.users[user_idx]
-            base_model.reset_state()
-            label = user_data.label
-            labels_arr[i] = label
-            label_t = torch.tensor([label], dtype=torch.long, device=device)
-            logits = model(user_data, n_neighbors)
-            total_loss += criterion(logits, label_t).item()
-            preds_arr[i] = torch.softmax(logits, dim=1)[0, 1].item()
-    
+        if use_batch_eval:
+            for start in range(0, n_indices, eval_batch_size):
+                end = min(start + eval_batch_size, n_indices)
+                batch_users = [dataset.users[indices[i]] for i in range(start, end)]
+                logits = base_model.forward_batch_users(batch_users, n_neighbors)
+                for i in range(end - start):
+                    pos = start + i
+                    label = dataset.users[indices[pos]].label
+                    labels_arr[pos] = label
+                    total_loss += criterion(logits[i : i + 1], torch.tensor([label], dtype=torch.long, device=device)).item()
+                    preds_arr[pos] = torch.softmax(logits[i : i + 1], dim=1)[0, 1].item()
+        else:
+            for i, user_idx in enumerate(indices):
+                user_data = dataset.users[user_idx]
+                base_model.reset_state()
+                label = user_data.label
+                labels_arr[i] = label
+                label_t = torch.tensor([label], dtype=torch.long, device=device)
+                logits = model(user_data, n_neighbors)
+                total_loss += criterion(logits, label_t).item()
+                preds_arr[i] = torch.softmax(logits, dim=1)[0, 1].item()
+
     avg_loss = total_loss / max(n_indices, 1)
     metrics = {}
     if n_indices > 0:
@@ -266,7 +260,8 @@ def main_worker(args,
             val_ratio=0.15,
             test_ratio=0.0,
             split_method=args.split_method,
-            seed=args.seed
+            seed=args.seed,
+            max_ego_hops=None if getattr(args, "max_ego_hops", 2) < 0 else getattr(args, "max_ego_hops", 2),
         )
     else:
         train_dataset, val_dataset, test_dataset, metadata = load_depression_data(
@@ -367,7 +362,7 @@ def main_worker(args,
             train_indices = list(train_sampler)
         
         epoch_start = time.time()
-        
+        train_start = time.time()
         train_loss, train_metrics = train_epoch(
             model=model,
             dataset=train_dataset,
@@ -383,14 +378,18 @@ def main_worker(args,
             use_parallel_conversations=getattr(args, "use_parallel_conversations", False),
             max_workers=getattr(args, "max_workers", 4),
         )
-        
+        train_time = time.time() - train_start
+
+        eval_start = time.time()
         val_loss, val_metrics, val_preds, val_labels = evaluate(
             model=model,
             dataset=val_dataset,
             device=device,
             n_neighbors=args.n_neighbors,
-            user_indices=val_indices
+            user_indices=val_indices,
+            eval_batch_size=getattr(args, "eval_batch_size", 8),
         )
+        eval_time = time.time() - eval_start
         
         if world_size > 1:
             preds_t = torch.from_numpy(val_preds.astype(np.float32)).to(device)
@@ -436,7 +435,7 @@ def main_worker(args,
         epoch_time = time.time() - epoch_start
         
         if rank == 0:
-            logger.info(f"Epoch {epoch + 1}/{args.epochs} ({epoch_time:.1f}s)")
+            logger.info(f"Epoch {epoch + 1}/{args.epochs} ({epoch_time:.1f}s) train={train_time:.1f}s eval={eval_time:.1f}s")
             logger.info(f"  Train Loss: {train_loss:.4f}, Metrics: {train_metrics}")
             logger.info(f"  Val Loss: {val_loss:.4f}, Metrics: {val_metrics}")
         
@@ -613,9 +612,13 @@ if __name__ == "__main__":
     parser.add_argument('--gpu_ids', type=str, default='0,1',
                         help='Comma-separated GPU IDs for multi-GPU (e.g. 0,1 for 2x T4)')
     parser.add_argument('--user_batch_size', type=int, default=4,
-                        help='Số lượng user xử lý trước mỗi lần optimizer.step(). Tăng lên 4-8 để tối ưu tốc độ.')
+                        help='Số lượng user xử lý trước mỗi lần optimizer.step(). Tăng 8-16 nếu đủ VRAM để train nhanh hơn.')
     parser.add_argument('--use_batch_forward', action='store_true', default=True,
                         help='Xử lý batch users trong LSTM mode (gom gradient của nhiều users). Mặc định True để tối ưu.')
+    parser.add_argument('--eval_batch_size', type=int, default=8,
+                        help='Số user gom một lần khi evaluate (LSTM mode). Tăng để val nhanh hơn.')
+    parser.add_argument('--max_ego_hops', type=int, default=2,
+                        help='Khi load parquet: chỉ giữ event trong L-hop ego (0/1/2). -1 = tắt (load full).')
     
     # Output arguments
     parser.add_argument('--save_dir', type=str, default='./saved_models',
