@@ -116,8 +116,8 @@ def train_epoch(model: TGNSequential,
             with torch.inference_mode():
                 p = torch.softmax(logits, dim=1)[0, 1].detach().cpu().numpy().item()
             batch_probs.append(p)
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         if batch_probs:
             all_preds.append(np.array(batch_probs, dtype=np.float32))
             all_labels.append(np.array(batch_labels_list, dtype=np.int64))

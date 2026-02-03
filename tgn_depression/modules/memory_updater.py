@@ -110,7 +110,7 @@ class SequenceMemoryUpdater(MemoryUpdater):
         
         # Store updated memory
         self.memory.set_memory(unique_node_ids, updated_memory)
-        self.memory.last_update[unique_node_ids] = timestamps
+        self.memory.set_last_update(unique_node_ids, timestamps)
     
     def get_updated_memory(
         self,
@@ -118,25 +118,19 @@ class SequenceMemoryUpdater(MemoryUpdater):
         unique_messages: torch.Tensor,
         timestamps: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get updated memory without persisting."""
+        """Get updated memory without persisting (legacy full-buffer path)."""
         if len(unique_node_ids) == 0:
-            return self.memory.memory.data.clone(), self.memory.last_update.data.clone()
+            return (
+                torch.zeros(0, self.memory.memory_dimension, device=self.memory.device),
+                torch.zeros(0, device=self.memory.device),
+            )
         
         # Verify temporal consistency
         assert (self.memory.get_last_update(unique_node_ids) <= timestamps).all().item(), \
             "Trying to update memory to time in the past"
-        
-        # Clone memory
-        updated_memory = self.memory.memory.data.clone()
-        updated_last_update = self.memory.last_update.data.clone()
-        
-        # Update specified nodes
-        current_memory = updated_memory[unique_node_ids]
+        current_memory = self.memory.get_memory(unique_node_ids)
         new_memory = self.memory_updater(unique_messages, current_memory)
-        updated_memory[unique_node_ids] = new_memory
-        updated_last_update[unique_node_ids] = timestamps
-        
-        return updated_memory, updated_last_update
+        return new_memory, timestamps
 
 
 class GRUMemoryUpdater(SequenceMemoryUpdater):

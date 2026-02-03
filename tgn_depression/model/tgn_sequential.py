@@ -37,6 +37,62 @@ except ImportError:
     from utils.neighbor_finder import get_neighbor_finder, get_temporal_ego_subgraph
 
 
+class _MemoryView:
+    """
+    View chỉ các node đã update (ego). Index bằng node_id → trả về hàng tương ứng hoặc 0.
+    Không cần full buffer (n_users, dim).
+    """
+    def __init__(self, device: torch.device, dim: int, updated_rows: Dict[int, torch.Tensor]):
+        self._device = device
+        self._dim = dim
+        self.updated = updated_rows
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple) and len(key) == 2:
+            indices, slice_obj = key
+        else:
+            indices = key
+            slice_obj = slice(None)
+        indices = np.asarray(indices).flatten()
+        if indices.size == 0:
+            return torch.empty(0, self._dim, device=self._device, dtype=torch.float32)
+        out = torch.zeros(len(indices), self._dim, device=self._device, dtype=torch.float32)
+        for i in range(len(indices)):
+            nid = int(indices[i])
+            if nid in self.updated:
+                out[i] = self.updated[nid]
+        if slice_obj != slice(None):
+            return out[slice_obj]
+        return out
+
+
+class _NodeFeaturesView:
+    """Chỉ lưu hàng cho node đã set (vd. target_user trong carryover), còn lại = 0."""
+    def __init__(self, device: torch.device, dim: int, custom: Dict[int, torch.Tensor]):
+        self._device = device
+        self._dim = dim
+        self.custom = custom
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple) and len(key) == 2:
+            indices, slice_obj = key
+        else:
+            indices, slice_obj = key, slice(None)
+        if hasattr(indices, 'cpu'):
+            indices = indices.cpu().numpy()
+        indices = np.asarray(indices).flatten()
+        if indices.size == 0:
+            return torch.empty(0, self._dim, device=self._device, dtype=torch.float32)
+        out = torch.zeros(len(indices), self._dim, device=self._device, dtype=torch.float32)
+        for i in range(len(indices)):
+            nid = int(indices[i])
+            if nid in self.custom:
+                out[i] = self.custom[nid]
+        if slice_obj != slice(None):
+            return out[slice_obj]
+        return out
+
+
 class TGNSequential(nn.Module):
     """
     TGN with Sequential Conversation Processing.
@@ -110,18 +166,9 @@ class TGNSequential(nn.Module):
             self.memory_dimension = 0
             self.n_node_features = self.n_edge_features
         
-        # Node features - có thể được cập nhật trong carryover mode
-        # Dùng buffer thay vì parameter để có thể modify
-        self.register_buffer(
-            'node_features',
-            torch.zeros((n_users, self.n_node_features))
-        )
-        
-        # Lưu node features gốc để reset
-        self.register_buffer(
-            'node_features_initial',
-            torch.zeros((n_users, self.n_node_features))
-        )
+        # Node features — chỉ lưu cho node đã set (target_user trong carryover), còn lại = 0
+        self._node_features_custom: Dict[int, torch.Tensor] = {}
+        self.node_features = _NodeFeaturesView(device, self.n_node_features, self._node_features_custom)
         
         # Embedding dimension
         self.embedding_dimension = self.n_node_features
@@ -241,8 +288,8 @@ class TGNSequential(nn.Module):
         if self.use_memory:
             self.memory.__init_memory__()
         
-        # Reset node features to initial values
-        self.node_features.copy_(self.node_features_initial)
+        # Reset node features (chỉ lưu ego/target_user nên clear dict)
+        self._node_features_custom.clear()
     
     def get_raw_messages(self,
                          source_nodes: np.ndarray,
@@ -256,10 +303,10 @@ class TGNSequential(nn.Module):
         source_memory = self.memory.get_memory(source_nodes)
         dest_memory = self.memory.get_memory(destination_nodes)
         
-        source_time_delta = edge_times_tensor - self.memory.last_update[source_nodes]
+        source_time_delta = edge_times_tensor - self.memory.get_last_update(source_nodes)
         source_time_encoding = self.time_encoder(source_time_delta).squeeze(1)
         
-        dest_time_delta = edge_times_tensor - self.memory.last_update[destination_nodes]
+        dest_time_delta = edge_times_tensor - self.memory.get_last_update(destination_nodes)
         dest_time_encoding = self.time_encoder(dest_time_delta).squeeze(1)
         
         source_message = torch.cat([
@@ -284,22 +331,21 @@ class TGNSequential(nn.Module):
         return (np.unique(source_nodes).tolist(), source_messages,
                 np.unique(destination_nodes).tolist(), dest_messages)
     
-    def get_updated_memory(self, nodes: List[int], messages: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get updated memory without persisting."""
+    def get_updated_memory(self, nodes: List[int], messages: Dict) -> Tuple[_MemoryView, Optional[torch.Tensor]]:
+        """Chỉ nodes có message (ego). Trả về view, không clone full buffer."""
         unique_nodes, unique_messages, unique_timestamps = \
             self.message_aggregator.aggregate(nodes, messages)
         
-        if len(unique_nodes) > 0:
-            unique_messages = self.message_function.compute_message(unique_messages)
-        
-        updated_memory, updated_last_update = self.memory_updater.get_updated_memory(
+        if len(unique_nodes) == 0:
+            return _MemoryView(self.device, self.memory.memory_dimension, {}), None
+        unique_messages = self.message_function.compute_message(unique_messages)
+        updated_rows, _ = self.memory_updater.get_updated_memory_rows_only(
             unique_nodes, unique_messages, timestamps=unique_timestamps
         )
-        # AMP compatibility: đảm bảo dtype khớp với buffer memory (thường là float32)
-        if updated_memory.dtype != self.memory.memory.dtype:
-            updated_memory = updated_memory.to(self.memory.memory.dtype)
-        
-        return updated_memory, updated_last_update
+        if updated_rows.dtype != torch.float32:
+            updated_rows = updated_rows.to(torch.float32)
+        updated_dict = {int(nid): updated_rows[i] for i, nid in enumerate(unique_nodes)}
+        return _MemoryView(self.device, self.memory.memory_dimension, updated_dict), None
     
     def update_memory(self, nodes: List[int], messages: Dict):
         """Update memory in-place."""
@@ -579,10 +625,8 @@ class TGNSequential(nn.Module):
                 target_user, end_time, n_neighbors
             )
             
-            # ===== CARRY-OVER: Update node features cho target user =====
-            # Embedding này sẽ được dùng làm khởi tạo cho conversation tiếp theo.
-            # .detach() khi ghi buffer để tránh giữ computation graph qua nhiều conversation.
-            self.node_features[target_user] = user_embedding.squeeze(0).detach()
+            # ===== CARRY-OVER: Chỉ lưu node features cho target user =====
+            self._node_features_custom[target_user] = user_embedding.squeeze(0).detach()
             
             last_embedding = user_embedding  # Giữ để classify từ tensor có grad
             
@@ -594,7 +638,10 @@ class TGNSequential(nn.Module):
         if last_embedding is not None:
             final_embedding = last_embedding
         else:
-            final_embedding = self.node_features[target_user].unsqueeze(0)
+            emb = self._node_features_custom.get(
+                target_user, torch.zeros(self.n_node_features, device=self.device)
+            )
+            final_embedding = emb.unsqueeze(0)
         
         return self.classifier(final_embedding)
     
