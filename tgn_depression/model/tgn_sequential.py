@@ -291,6 +291,9 @@ class TGNSequential(nn.Module):
         updated_memory, updated_last_update = self.memory_updater.get_updated_memory(
             unique_nodes, unique_messages, timestamps=unique_timestamps
         )
+        # AMP compatibility: đảm bảo dtype khớp với buffer memory (thường là float32)
+        if updated_memory.dtype != self.memory.memory.dtype:
+            updated_memory = updated_memory.to(self.memory.memory.dtype)
         
         return updated_memory, updated_last_update
     
