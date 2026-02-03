@@ -176,8 +176,10 @@ class DepressionDataset:
             'embedding_dim': self.embedding_dim
         }
     
-    def print_statistics(self):
-        """Print dataset statistics."""
+    def print_statistics(self, verbose: bool = True):
+        """Print dataset statistics. Set verbose=False khi DDP để chỉ rank 0 in."""
+        if not verbose:
+            return
         stats = self.get_statistics()
         print("=" * 50)
         print("Dataset Statistics:")

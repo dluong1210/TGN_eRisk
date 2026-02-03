@@ -258,8 +258,9 @@ def main_worker(args,
     if world_size > 1:
         dist.barrier()
     
-    # Load data
-    logger.info("Loading data...")
+    # Load data (chỉ rank 0 in log/print để tránh trùng khi DDP)
+    if rank == 0:
+        logger.info("Loading data...")
     if args.use_dummy_data:
         train_dataset, val_dataset, test_dataset, metadata = create_dummy_data(
             n_total_users=args.n_total_users,
@@ -271,7 +272,6 @@ def main_worker(args,
             save_dir=args.data_dir if args.save_dummy else None
         )
     elif getattr(args, "data_format", "csv_json") == "parquet_folders":
-        # Chỉ chia train/val, không chia tập test (test chạy riêng với run_test_parquet.py)
         train_dataset, val_dataset, test_dataset, metadata = load_depression_data_from_parquet_folders(
             data_dir=args.data_dir,
             neg_folder=args.neg_folder,
@@ -281,6 +281,7 @@ def main_worker(args,
             split_method=args.split_method,
             seed=args.seed,
             max_ego_hops=None if getattr(args, "max_ego_hops", 2) < 0 else getattr(args, "max_ego_hops", 2),
+            verbose=(rank == 0),
         )
     else:
         train_dataset, val_dataset, test_dataset, metadata = load_depression_data(
@@ -291,11 +292,11 @@ def main_worker(args,
             seed=args.seed
         )
     
-    logger.info("Training dataset:")
-    train_dataset.print_statistics()
+    if rank == 0:
+        logger.info("Training dataset:")
+        train_dataset.print_statistics(verbose=True)
 
     # IMPORTANT (DDP): remove empty users so every rank runs same #steps
-    # (otherwise some ranks may `continue` and collective ALLREDUCE can hang)
     def _filter_nonempty(ds: DepressionDataset) -> DepressionDataset:
         ds.users = [u for u in ds.users if u.total_interactions > 0]
         return ds
@@ -306,15 +307,16 @@ def main_worker(args,
 
     if rank == 0:
         logger.info("Training dataset (after filtering empty users):")
-        train_dataset.print_statistics()
+        train_dataset.print_statistics(verbose=True)
     
     # Compute class weights
     train_labels = np.array([u.label for u in train_dataset.users])
     class_weights = compute_class_weights(train_labels).to(device).float()
-    logger.info(f"Class weights: {class_weights}")
+    if rank == 0:
+        logger.info(f"Class weights: {class_weights}")
     
-    # Initialize model
-    logger.info(f"Initializing TGN Sequential model ({args.sequence_mode} mode)...")
+    if rank == 0:
+        logger.info(f"Initializing TGN Sequential model ({args.sequence_mode} mode)...")
     model = TGNSequential(
         n_users=metadata['n_total_users'],
         edge_features=train_dataset.post_embeddings,
@@ -370,6 +372,13 @@ def main_worker(args,
     train_indices = list(train_sampler) if train_sampler is not None else None
     val_indices = list(val_sampler) if val_sampler is not None else None
     
+    # DDP: giới hạn user_batch_size để tránh OOM (mỗi GPU xử lý batch nhỏ hơn)
+    user_batch_size = getattr(args, "user_batch_size", 4)
+    if world_size > 1 and getattr(args, "use_batch_forward", True):
+        user_batch_size = min(user_batch_size, 4)
+        if rank == 0:
+            logger.info(f"DDP: capping user_batch_size to {user_batch_size} per GPU to reduce OOM risk.")
+    
     if rank == 0:
         logger.info("Starting training...")
     best_val_auc = 0
@@ -392,7 +401,7 @@ def main_worker(args,
             user_indices=train_indices,
             rank=rank,
             world_size=world_size,
-            user_batch_size=getattr(args, "user_batch_size", 4),
+            user_batch_size=user_batch_size,
             use_batch_forward=getattr(args, "use_batch_forward", True),
             use_parallel_conversations=getattr(args, "use_parallel_conversations", False),
             max_workers=getattr(args, "max_workers", 4),

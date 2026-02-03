@@ -384,6 +384,7 @@ def load_depression_data_from_parquet_folders(
     split_method: str = "stratified",
     seed: int = 42,
     max_ego_hops: Optional[int] = 2,
+    verbose: bool = True,
 ) -> Tuple[DepressionDataset, DepressionDataset, DepressionDataset, Dict]:
     """
     Load data từ 2 folder neg (label 0) và pos (label 1).
@@ -414,7 +415,8 @@ def load_depression_data_from_parquet_folders(
     if not pos_path.exists():
         raise FileNotFoundError(f"Folder not found: {pos_path}")
     
-    print("Loading data from parquet folders...")
+    if verbose:
+        print("Loading data from parquet folders...")
     
     # Thu thập tất cả parquet paths và labels
     parquet_files: List[Tuple[Path, int]] = []
@@ -426,8 +428,9 @@ def load_depression_data_from_parquet_folders(
     if len(parquet_files) == 0:
         raise ValueError(f"No .parquet files found in {neg_path} or {pos_path}")
     
-    print(f"  Found {len(parquet_files)} parquet files")
-    if max_ego_hops is not None:
+    if verbose:
+        print(f"  Found {len(parquet_files)} parquet files")
+    if verbose and max_ego_hops is not None:
         print(f"  max_ego_hops={max_ego_hops}: chỉ load event trong {max_ego_hops}-hop ego của target user (bỏ event thừa)")
     
     # Một lần đọc mỗi parquet: vừa thu thập users/embeddings vừa lưu raw rows để sau build UserData
@@ -494,7 +497,8 @@ def load_depression_data_from_parquet_folders(
             post_embeddings[i] = arr[:embedding_dim]
         else:
             post_embeddings[i, :d] = arr
-    print(f"  Total users: {n_total_users}, posts: {n_posts}, embedding_dim: {embedding_dim} (single-pass load)")
+    if verbose:
+        print(f"  Total users: {n_total_users}, posts: {n_posts}, embedding_dim: {embedding_dim} (single-pass load)")
     
     # Build UserData từ pending rows (không đọc lại parquet)
     all_user_data: List[UserData] = []
@@ -555,7 +559,8 @@ def load_depression_data_from_parquet_folders(
         )
         all_user_data.append(user_data)
     
-    print(f"  Created {len(all_user_data)} target user samples")
+    if verbose:
+        print(f"  Created {len(all_user_data)} target user samples")
     
     # Split: test_ratio=0 → chỉ train/val; val_ratio=0 & test_ratio=0 → toàn bộ là train (để dùng làm test set)
     n_total = len(all_user_data)
@@ -599,7 +604,8 @@ def load_depression_data_from_parquet_folders(
         val_users = [all_user_data[i] for i in perm[n_train:n_train + n_val]]
         test_users = [all_user_data[i] for i in perm[n_train + n_val:n_train + n_val + n_test]]
     
-    print(f"  Split ({split_method}): {len(train_users)} train, {len(val_users)} val" + (f", {len(test_users)} test" if test_users else " (no test)"))
+    if verbose:
+        print(f"  Split ({split_method}): {len(train_users)} train, {len(val_users)} val" + (f", {len(test_users)} test" if test_users else " (no test)"))
     
     train_dataset = DepressionDataset(
         users=train_users,
