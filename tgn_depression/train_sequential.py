@@ -99,35 +99,54 @@ def train_epoch(model: TGNSequential,
         
         optimizer.zero_grad()
         
-        # Luôn xử lý từng user (không dùng forward_batch_users) để tránh giữ nhiều computation
-        # graph cùng lúc -> VRAM tăng / OOM. Gradient được accumulate qua từng user rồi step 1 lần.
-        n_in_batch = len(batch_indices)
-        batch_probs = []
-        batch_labels_list = []
-        for user_idx in batch_indices:
-            user_data = dataset.users[user_idx]
-            base_model.reset_state()
-            logits = model(user_data, n_neighbors)
-            batch_labels_list.append(user_data.label)
-            loss = criterion(logits, torch.tensor([user_data.label], dtype=torch.long, device=device))
-            # Scale loss để gradient accumulate = mean over batch (giống CrossEntropyLoss trung bình)
-            (loss / n_in_batch).backward()
+        # Nhánh nhanh: batch forward (LSTM) — 1 forward gom nhiều user, ít backward hơn. Cần đủ VRAM.
+        if use_batch_forward and base_model.sequence_mode == 'lstm' and len(batch_indices) > 1:
+            batch_users_data = [dataset.users[i] for i in batch_indices]
+            batch_labels = torch.tensor(
+                [dataset.users[i].label for i in batch_indices],
+                dtype=torch.long, device=device
+            )
+            logits = base_model.forward_batch_users(
+                batch_users_data, n_neighbors,
+                use_parallel_conversations=use_parallel_conversations,
+                max_workers=max_workers
+            )
+            loss = criterion(logits, batch_labels)
+            loss.backward()
             base_model.detach_memory()
-            total_loss += loss.item()
-            n_users_processed += 1
-            # Lấy prob ngay, chuyển CPU, không giữ logits để giải phóng graph
+            total_loss += loss.item() * len(batch_indices)
+            n_users_processed += len(batch_indices)
             with torch.inference_mode():
-                p = torch.softmax(logits, dim=1)[0, 1].detach().cpu().numpy().item()
-            batch_probs.append(p)
-        if batch_probs:
-            all_preds.append(np.array(batch_probs, dtype=np.float32))
-            all_labels.append(np.array(batch_labels_list, dtype=np.int64))
+                probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy().copy()
+            all_preds.append(probs)
+            all_labels.append(batch_labels.cpu().numpy().copy())
+            del logits, probs, batch_labels
+        else:
+            # Nhánh tiết kiệm VRAM: từng user, accumulate gradient rồi step 1 lần.
+            n_in_batch = len(batch_indices)
+            batch_probs = []
+            batch_labels_list = []
+            for user_idx in batch_indices:
+                user_data = dataset.users[user_idx]
+                base_model.reset_state()
+                logits = model(user_data, n_neighbors)
+                batch_labels_list.append(user_data.label)
+                loss = criterion(logits, torch.tensor([user_data.label], dtype=torch.long, device=device))
+                (loss / n_in_batch).backward()
+                base_model.detach_memory()
+                total_loss += loss.item()
+                n_users_processed += 1
+                with torch.inference_mode():
+                    p = torch.softmax(logits, dim=1)[0, 1].detach().cpu().numpy().item()
+                batch_probs.append(p)
+            if batch_probs:
+                all_preds.append(np.array(batch_probs, dtype=np.float32))
+                all_labels.append(np.array(batch_labels_list, dtype=np.int64))
         
-        # Update optimizer sau khi xử lý xong một batch user
         optimizer.step()
         
-        # Định kỳ giải phóng cache GPU để tránh phân mảnh / tràn VRAM
-        if device.type == "cuda" and (batch_start // user_batch_size + 1) % 50 == 0:
+        # Giải phóng cache GPU định kỳ (không quá dày để tránh chậm)
+        if device.type == "cuda" and (batch_start // user_batch_size + 1) % 200 == 0:
             torch.cuda.empty_cache()
         
         if rank == 0 and ((batch_start // user_batch_size) + 1) % 100 == 0:
@@ -512,11 +531,20 @@ def worker_fn(rank: int, args, n_gpus: int, gpu_ids: List[int]):
 
 def main(args):
     """Entry point. Single-GPU or multi-GPU via spawn."""
-    if getattr(args, 'multi_gpu', False):
-        gpu_ids = [int(x) for x in args.gpu_ids.split(",")]
-        n_gpus = len(gpu_ids)
-        mp.spawn(worker_fn, args=(args, n_gpus, gpu_ids), nprocs=n_gpus, join=True)
+    use_multi = getattr(args, 'multi_gpu', False)
+    gpu_ids = [int(x) for x in getattr(args, 'gpu_ids', '0').split(",")]
+    n_gpus_requested = len(gpu_ids)
+    n_gpus_available = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+    # Tránh mp.spawn khi chỉ có 1 GPU hoặc chỉ yêu cầu 1 GPU (tránh SIGABRT trên Kaggle/Colab)
+    if use_multi and n_gpus_requested > 1 and n_gpus_available >= n_gpus_requested:
+        mp.spawn(worker_fn, args=(args, n_gpus_requested, gpu_ids), nprocs=n_gpus_requested, join=True)
     else:
+        if use_multi and n_gpus_requested > 1 and n_gpus_available < n_gpus_requested:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"multi_gpu requested with {n_gpus_requested} GPUs but only {n_gpus_available} available. Running single-GPU on GPU {gpu_ids[0]}."
+            )
         main_worker(args)
 
 
