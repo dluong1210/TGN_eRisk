@@ -124,32 +124,33 @@ def train_epoch(model: TGNSequential,
             # Loss đã là trung bình, nên nhân với batch_size để có total loss
             total_loss += loss.item() * len(batch_indices)
             n_users_processed += len(batch_indices)
-            # Một lần softmax + cpu (nhanh hơn)
+            # Một lần softmax + cpu (nhanh hơn); xong thì giải phóng logits để tránh giữ graph
             with torch.inference_mode():
                 probs = torch.softmax(logits, dim=1)[:, 1]
-                all_preds.append(probs.cpu().numpy())
-                all_labels.append(batch_labels.cpu().numpy())
+                all_preds.append(probs.cpu().numpy().copy())
+                all_labels.append(batch_labels.cpu().numpy().copy())
+            del logits, probs
         else:
-            # Xử lý từng user: gom logits rồi softmax một lần (giảm .cpu() và sync)
-            logits_list = []
+            # Xử lý từng user: không giữ logits (tránh giữ computation graph -> VRAM tăng/OOM)
+            batch_probs = []
             batch_labels_list = []
             for user_idx in batch_indices:
                 user_data = dataset.users[user_idx]
                 base_model.reset_state()
                 logits = model(user_data, n_neighbors)
-                logits_list.append(logits)
                 batch_labels_list.append(user_data.label)
                 loss = criterion(logits, torch.tensor([user_data.label], dtype=torch.long, device=device))
                 loss.backward()
                 base_model.detach_memory()
                 total_loss += loss.item()
                 n_users_processed += 1
-            if logits_list:
+                # Lấy prob ngay, chuyển CPU, không giữ logits để giải phóng graph
                 with torch.inference_mode():
-                    logits_cat = torch.cat(logits_list, dim=0)
-                    probs = torch.softmax(logits_cat, dim=1)[:, 1].cpu().numpy()
-                    all_preds.append(probs)
-                    all_labels.append(np.array(batch_labels_list, dtype=np.int64))
+                    p = torch.softmax(logits, dim=1)[0, 1].detach().cpu().numpy().item()
+                batch_probs.append(p)
+            if batch_probs:
+                all_preds.append(np.array(batch_probs, dtype=np.float32))
+                all_labels.append(np.array(batch_labels_list, dtype=np.int64))
         
         # Update optimizer sau khi xử lý xong một batch user
         optimizer.step()
@@ -158,6 +159,8 @@ def train_epoch(model: TGNSequential,
             logging.info(f"  Processed {batch_start + len(batch_indices)}/{len(indices)} users (rank 0)")
     
     avg_loss = total_loss / max(n_users_processed, 1)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     metrics = {}
     if all_preds:
         all_preds = np.concatenate(all_preds, axis=0)

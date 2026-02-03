@@ -42,6 +42,33 @@ def _embedding_to_1d(emb):
     return np.array(flat, dtype=np.float32)
 
 
+def _ego_nodes_from_conv_rows(
+    rows: List[Tuple[str, str, float]],
+    target_user_str: str,
+    max_hops: int,
+) -> set:
+    """
+    Tập user (str) trong L-hop ego của target_user từ danh sách cạnh (uid, pid, ts).
+    Dùng khi load parquet để chỉ giữ event trong ego, tránh load event không dùng (model chỉ dùng 0/1/2 layer).
+    """
+    if max_hops < 0:
+        return set()
+    ego: set = {target_user_str}
+    if max_hops == 0:
+        return ego
+    n_hops = min(max_hops, 2)
+    for _ in range(n_hops):
+        next_ego = set(ego)
+        for r in rows:
+            uid, pid = r[0], r[1]
+            if uid in ego:
+                next_ego.add(pid)
+            if pid in ego:
+                next_ego.add(uid)
+        ego = next_ego
+    return ego
+
+
 def _stratified_split(
     indices: np.ndarray,
     labels: np.ndarray,
@@ -109,46 +136,54 @@ def load_depression_data(
     """
     print("Loading data...")
     
+    # Load JSON labels first (để biết target users, tránh load data thừa)
+    with open(labels_path, 'r') as f:
+        labels_data = json.load(f)
+    print(f"  Loaded labels for {len(labels_data)} target users")
+    target_user_str_set = {str(u) for u in labels_data.keys()}
+    
     # Load CSV interactions
     interactions_df = pd.read_csv(interactions_path)
     print(f"  Loaded {len(interactions_df)} interactions from CSV")
     
-    # Load JSON embeddings
+    # Chỉ giữ conversations có ít nhất một target user (tránh load conversations không dùng tới)
+    conv_id_to_users = defaultdict(set)
+    for _, row in interactions_df.iterrows():
+        uid = str(row["userID"])
+        pid = row["parentID"]
+        conv_id = str(row["conversation_id"])
+        conv_id_to_users[conv_id].add(uid)
+        if pd.notna(pid):
+            conv_id_to_users[conv_id].add(str(pid))
+    needed_conv_ids = {
+        cid for cid, users in conv_id_to_users.items()
+        if users & target_user_str_set
+    }
+    interactions_df = interactions_df[
+        interactions_df["conversation_id"].astype(str).isin(needed_conv_ids)
+    ].copy()
+    print(f"  Kept {len(interactions_df)} interactions in {len(needed_conv_ids)} conversations (with ≥1 target user)")
+    
+    # Load JSON embeddings (chỉ target users)
     with open(embeddings_path, 'r') as f:
         embeddings_data = json.load(f)
     print(f"  Loaded embeddings for {len(embeddings_data)} target users")
     
-    # Load JSON labels
-    with open(labels_path, 'r') as f:
-        labels_data = json.load(f)
-    print(f"  Loaded labels for {len(labels_data)} target users")
-    
-    # Get all unique users from interactions
-    all_users = set(interactions_df['userID'].unique())
-    # parentID có thể là None/NaN cho root posts
-    parent_users = interactions_df['parentID'].dropna().unique()
+    # Users: chỉ từ interactions đã lọc + target users từ labels
+    all_users = set(interactions_df['userID'].astype(str))
+    parent_users = interactions_df['parentID'].dropna().astype(str)
     all_users.update(parent_users)
+    all_users |= target_user_str_set
     
-    # Convert to strings for consistency
-    all_users = {str(u) for u in all_users}
-    
-    # Add target users from labels (in case they don't appear in interactions)
-    all_users.update(labels_data.keys())
-    
-    # Create user mappings
     user_to_idx = {user: idx for idx, user in enumerate(sorted(all_users))}
     idx_to_user = {idx: user for user, idx in user_to_idx.items()}
     n_total_users = len(user_to_idx)
+    print(f"  Found {n_total_users} unique users (only in needed conversations)")
     
-    print(f"  Found {n_total_users} unique users")
-    
-    # Build post_id to embedding mapping and create embedding matrix
-    # First, collect all unique post_ids
+    # Post IDs: chỉ từ embeddings (target users) + interactions đã lọc
     all_post_ids = set()
     for target_user, posts in embeddings_data.items():
-        all_post_ids.update(posts.keys())
-    
-    # Also add post_ids from interactions
+        all_post_ids.update(str(pid) for pid in posts.keys())
     all_post_ids.update(interactions_df['post_id'].astype(str).unique())
     
     # Create post_id mapping
@@ -347,7 +382,8 @@ def load_depression_data_from_parquet_folders(
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
     split_method: str = "stratified",
-    seed: int = 42
+    seed: int = 42,
+    max_ego_hops: Optional[int] = 2,
 ) -> Tuple[DepressionDataset, DepressionDataset, DepressionDataset, Dict]:
     """
     Load data từ 2 folder neg (label 0) và pos (label 1).
@@ -362,6 +398,9 @@ def load_depression_data_from_parquet_folders(
         val_ratio, test_ratio: Tỉ lệ val/test
         split_method: 'stratified' hoặc 'random'
         seed: Random seed
+        max_ego_hops: Nếu set (0, 1, hoặc 2), chỉ giữ event trong L-hop ego của target user
+            trong mỗi conversation, bỏ event không dùng tới (model chỉ dùng 0/1/2 layer).
+            None = giữ toàn bộ event (backward compatible).
     
     Returns:
         train_dataset, val_dataset, test_dataset, metadata
@@ -388,37 +427,57 @@ def load_depression_data_from_parquet_folders(
         raise ValueError(f"No .parquet files found in {neg_path} or {pos_path}")
     
     print(f"  Found {len(parquet_files)} parquet files")
+    if max_ego_hops is not None:
+        print(f"  max_ego_hops={max_ego_hops}: chỉ load event trong {max_ego_hops}-hop ego của target user (bỏ event thừa)")
     
-    # Pass 1: Thu thập tất cả users và (post_id, embedding)
+    # Một lần đọc mỗi parquet: vừa thu thập users/embeddings vừa lưu raw rows để sau build UserData
     all_users: set = set()
     post_id_to_embedding: Dict[str, np.ndarray] = {}
+    # (target_user_id_str, label, list of (uid_str, pid_str, timestamp, post_id_str, conv_id))
+    pending_per_file: List[Tuple[str, int, List[Tuple[str, str, float, str, str]]]] = []
     
-    for parquet_path, _ in parquet_files:
+    for parquet_path, label in parquet_files:
         df = pd.read_parquet(parquet_path)
-        # Cột: userID, parentID, timestamp, post_id, conversation_id, embedding
+        target_user_id_str = parquet_path.stem
+        all_users.add(target_user_id_str)
+        
         for col in ["userID", "parentID", "timestamp", "post_id", "conversation_id", "embedding"]:
             if col not in df.columns:
                 raise ValueError(f"Missing column '{col}' in {parquet_path}")
         
-        for _, row in df.iterrows():
-            if pd.isna(row["userID"]):
-                continue
-            uid = str(row["userID"])
-            all_users.add(uid)
-            pid = row["parentID"]
-            if pd.notna(pid):
-                all_users.add(str(pid))
-            
-            post_id = str(row["post_id"])
-            if post_id not in post_id_to_embedding:
-                post_id_to_embedding[post_id] = _embedding_to_1d(row["embedding"])
+        df = df[df["parentID"].notna() & df["userID"].notna()].copy()
+        file_rows: List[Tuple[str, str, float, str, str]] = []
+        
+        # Group by conversation; nếu max_ego_hops set thì chỉ giữ event trong L-hop ego của target user
+        conv_groups = list(df.groupby("conversation_id", sort=False))
+        for conv_id, group in conv_groups:
+            group = group.sort_values("timestamp").reset_index(drop=True)
+            # (uid, pid, ts, post_id, embedding) để sau khi lọc ego vẫn có embedding
+            rows_raw = [
+                (str(row["userID"]), str(row["parentID"]), float(row["timestamp"]), str(row["post_id"]), _embedding_to_1d(row["embedding"]))
+                for _, row in group.iterrows()
+            ]
+            if max_ego_hops is not None:
+                ego = _ego_nodes_from_conv_rows(
+                    [(r[0], r[1], r[2]) for r in rows_raw],
+                    target_user_id_str,
+                    max_ego_hops,
+                )
+                rows_raw = [r for r in rows_raw if r[0] in ego or r[1] in ego]
+            for uid, pid, ts, post_id, emb in rows_raw:
+                all_users.add(uid)
+                all_users.add(pid)
+                if post_id not in post_id_to_embedding:
+                    post_id_to_embedding[post_id] = emb
+                file_rows.append((uid, pid, ts, post_id, str(conv_id)))
+        
+        pending_per_file.append((target_user_id_str, label, file_rows))
     
-    # User mappings
+    # User mappings và post embedding matrix (chỉ từ dữ liệu đã đọc)
     user_to_idx = {u: i for i, u in enumerate(sorted(all_users))}
     idx_to_user = {i: u for u, i in user_to_idx.items()}
     n_total_users = len(user_to_idx)
     
-    # Post embeddings matrix
     post_ids_sorted = sorted(post_id_to_embedding.keys())
     post_id_to_idx = {pid: i for i, pid in enumerate(post_ids_sorted)}
     idx_to_post_id = {i: pid for pid, i in post_id_to_idx.items()}
@@ -435,26 +494,13 @@ def load_depression_data_from_parquet_folders(
             post_embeddings[i] = arr[:embedding_dim]
         else:
             post_embeddings[i, :d] = arr
-    print(f"  Total users: {n_total_users}, posts: {n_posts}, embedding_dim: {embedding_dim}")
+    print(f"  Total users: {n_total_users}, posts: {n_posts}, embedding_dim: {embedding_dim} (single-pass load)")
     
-    # Pass 2: Build UserData cho mỗi parquet
+    # Build UserData từ pending rows (không đọc lại parquet)
     all_user_data: List[UserData] = []
-    
-    for parquet_path, label in parquet_files:
-        target_user_id_str = parquet_path.stem
-        df = pd.read_parquet(parquet_path)
-        
-        # Đảm bảo target user có trong user_to_idx (có thể chưa xuất hiện trong interactions)
-        if target_user_id_str not in user_to_idx:
-            user_to_idx[target_user_id_str] = n_total_users
-            idx_to_user[n_total_users] = target_user_id_str
-            n_total_users += 1
-        
+    for target_user_id_str, label, file_rows in pending_per_file:
         user_idx = user_to_idx[target_user_id_str]
-        
-        # Bỏ dòng không có parentID (root post) hoặc userID
-        df = df[df["parentID"].notna() & df["userID"].notna()].copy()
-        if len(df) == 0:
+        if len(file_rows) == 0:
             all_user_data.append(UserData(
                 user_id=user_idx,
                 user_id_str=target_user_id_str,
@@ -463,43 +509,43 @@ def load_depression_data_from_parquet_folders(
             ))
             continue
         
-        # Group by conversation_id
+        # Group by conversation_id, giữ thứ tự xuất hiện trong file
+        conv_id_to_rows: Dict[str, List[Tuple[str, str, float, str]]] = {}
+        for uid_str, pid_str, ts, post_id_str, conv_id in file_rows:
+            conv_id_to_rows.setdefault(conv_id, []).append((uid_str, pid_str, ts, post_id_str))
+        # Thứ tự conv theo lần gặp đầu trong file_rows
+        conv_order = []
+        seen = set()
+        for _, _, _, _, conv_id in file_rows:
+            if conv_id not in seen:
+                seen.add(conv_id)
+                conv_order.append(conv_id)
+        
         conversations_list: List[Conversation] = []
-        # IMPORTANT: Keep conversation order as it appears in the file (no sorting by conversation_id).
-        for conv_id, group in df.groupby("conversation_id", sort=False):
-            group = group.sort_values("timestamp").reset_index(drop=True)
+        for conv_id in conv_order:
+            rows = conv_id_to_rows[conv_id]
+            rows = sorted(rows, key=lambda r: r[2])
             rows_valid = []
-            for _, row in group.iterrows():
-                uid_str = str(row["userID"])
-                pid_str = str(row["parentID"])
+            for uid_str, pid_str, ts, post_id_str in rows:
                 if uid_str not in user_to_idx or pid_str not in user_to_idx:
                     continue
-                post_id_str = str(row["post_id"])
                 post_idx = post_id_to_idx.get(post_id_str, 0)
                 rows_valid.append((
                     user_to_idx[uid_str],
                     user_to_idx[pid_str],
-                    float(row["timestamp"]),
+                    ts,
                     post_idx
                 ))
             if len(rows_valid) == 0:
                 continue
-            
-            source_users = np.array([r[0] for r in rows_valid], dtype=np.int64)
-            dest_users = np.array([r[1] for r in rows_valid], dtype=np.int64)
-            timestamps = np.array([r[2] for r in rows_valid], dtype=np.float64)
-            post_ids = np.array([r[3] for r in rows_valid], dtype=np.int64)
-            
             conv = Conversation(
-                conversation_id=str(conv_id),
-                source_users=source_users,
-                dest_users=dest_users,
-                timestamps=timestamps,
-                post_ids=post_ids
+                conversation_id=conv_id,
+                source_users=np.array([r[0] for r in rows_valid], dtype=np.int64),
+                dest_users=np.array([r[1] for r in rows_valid], dtype=np.int64),
+                timestamps=np.array([r[2] for r in rows_valid], dtype=np.float64),
+                post_ids=np.array([r[3] for r in rows_valid], dtype=np.int64)
             )
             conversations_list.append(conv)
-        # IMPORTANT: Do NOT sort conversations_list.
-        # The conversation sequence is assumed to follow the order in the input data.
         
         user_data = UserData(
             user_id=user_idx,
