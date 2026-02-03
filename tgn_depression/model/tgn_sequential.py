@@ -39,13 +39,15 @@ except ImportError:
 
 class _MemoryView:
     """
-    View chỉ các node đã update (ego). Index bằng node_id → trả về hàng tương ứng hoặc 0.
-    Không cần full buffer (n_users, dim).
+    View = pending updates (updated_rows) + persisted (base_getter). Đúng với TGN: embedding đọc
+    memory đã persist cho node không có pending message; node có pending thì dùng kết quả aggregate.
     """
-    def __init__(self, device: torch.device, dim: int, updated_rows: Dict[int, torch.Tensor]):
+    def __init__(self, device: torch.device, dim: int, updated_rows: Dict[int, torch.Tensor],
+                 base_getter=None):
         self._device = device
         self._dim = dim
         self.updated = updated_rows
+        self._base_getter = base_getter  # callable(node_ids) -> [len(node_ids), dim]
 
     def __getitem__(self, key):
         if isinstance(key, tuple) and len(key) == 2:
@@ -57,10 +59,19 @@ class _MemoryView:
         if indices.size == 0:
             return torch.empty(0, self._dim, device=self._device, dtype=torch.float32)
         out = torch.zeros(len(indices), self._dim, device=self._device, dtype=torch.float32)
+        missing = []
+        missing_idx = []
         for i in range(len(indices)):
             nid = int(indices[i])
             if nid in self.updated:
                 out[i] = self.updated[nid]
+            else:
+                missing.append(nid)
+                missing_idx.append(i)
+        if missing and self._base_getter is not None:
+            base_rows = self._base_getter(missing)
+            for k, idx in enumerate(missing_idx):
+                out[idx] = base_rows[k]
         if slice_obj != slice(None):
             return out[slice_obj]
         return out
@@ -332,20 +343,23 @@ class TGNSequential(nn.Module):
                 np.unique(destination_nodes).tolist(), dest_messages)
     
     def get_updated_memory(self, nodes: List[int], messages: Dict) -> Tuple[_MemoryView, Optional[torch.Tensor]]:
-        """Chỉ nodes có message (ego). Trả về view, không clone full buffer."""
+        """
+        View = pending updates (nodes có message) + persisted (memory.get_memory) cho node còn lại.
+        Đúng với TGN gốc: embedding dùng memory đã cập nhật cho node có message, còn lại đọc từ persist.
+        """
         unique_nodes, unique_messages, unique_timestamps = \
             self.message_aggregator.aggregate(nodes, messages)
-        
+        base_getter = lambda ids: self.memory.get_memory(ids)
         if len(unique_nodes) == 0:
-            return _MemoryView(self.device, self.memory.memory_dimension, {}), None
+            return _MemoryView(self.device, self.memory.memory_dimension, {}, base_getter=base_getter), None
         unique_messages = self.message_function.compute_message(unique_messages)
-        updated_rows, _ = self.memory_updater.get_updated_memory_rows_only(
+        updated_rows, _ = self.memory_updater.get_updated_memory(
             unique_nodes, unique_messages, timestamps=unique_timestamps
         )
         if updated_rows.dtype != torch.float32:
             updated_rows = updated_rows.to(torch.float32)
         updated_dict = {int(nid): updated_rows[i] for i, nid in enumerate(unique_nodes)}
-        return _MemoryView(self.device, self.memory.memory_dimension, updated_dict), None
+        return _MemoryView(self.device, self.memory.memory_dimension, updated_dict, base_getter=base_getter), None
     
     def update_memory(self, nodes: List[int], messages: Dict):
         """Update memory in-place."""
