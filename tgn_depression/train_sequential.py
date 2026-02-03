@@ -76,7 +76,9 @@ def train_epoch(model: TGNSequential,
                 rank: int = 0,
                 world_size: int = 1,
                 user_batch_size: int = 1,
-                use_batch_forward: bool = False) -> Tuple[float, Dict]:
+                use_batch_forward: bool = False,
+                use_parallel_conversations: bool = False,
+                max_workers: int = 4) -> Tuple[float, Dict]:
     """Train for one epoch. If user_indices is set (DDP), only process those users."""
     model.train()
     base_model = model.module if hasattr(model, 'module') else model
@@ -104,11 +106,9 @@ def train_epoch(model: TGNSequential,
         # Forward batch users (chỉ LSTM mode)
         if use_batch_forward and base_model.sequence_mode == 'lstm' and len(batch_indices) > 1:
             # Xử lý batch users (forward_batch_users sẽ reset state cho mỗi user)
-            use_parallel_conv = getattr(args, "use_parallel_conversations", False)
-            max_workers = getattr(args, "max_workers", 4)
             logits = base_model.forward_batch_users(
                 batch_users_data, n_neighbors,
-                use_parallel_conversations=use_parallel_conv,
+                use_parallel_conversations=use_parallel_conversations,
                 max_workers=max_workers
             )
             # CrossEntropyLoss tự động tính trung bình trên batch, không cần normalize
@@ -375,7 +375,9 @@ def main_worker(args,
             rank=rank,
             world_size=world_size,
             user_batch_size=getattr(args, "user_batch_size", 4),
-            use_batch_forward=getattr(args, "use_batch_forward", True)
+            use_batch_forward=getattr(args, "use_batch_forward", True),
+            use_parallel_conversations=getattr(args, "use_parallel_conversations", False),
+            max_workers=getattr(args, "max_workers", 4),
         )
         
         val_loss, val_metrics, val_preds, val_labels = evaluate(
@@ -498,7 +500,11 @@ def worker_fn(rank: int, args, n_gpus: int, gpu_ids: List[int]):
     else:
         dist.barrier()
 
-    main_worker(args, device=device, rank=rank, world_size=n_gpus)
+    try:
+        main_worker(args, device=device, rank=rank, world_size=n_gpus)
+    finally:
+        if n_gpus > 1 and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def main(args):
