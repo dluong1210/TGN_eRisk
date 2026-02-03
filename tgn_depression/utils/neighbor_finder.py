@@ -2,10 +2,11 @@
 Neighbor Finder for Temporal Graph.
 
 Tìm temporal neighbors của một node tại một thời điểm cụ thể.
+Hỗ trợ tối ưu L-hop ego subgraph (layer=0, 1, 2) để tránh tính toán thừa.
 """
 
 import numpy as np
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Set
 from collections import defaultdict
 
 
@@ -108,6 +109,87 @@ class NeighborFinder:
                 edge_idxs[i, n_neighbors - n_take:] = src_edge_idxs[-n_take:]
         
         return neighbors, edge_idxs, edge_times
+
+
+def get_temporal_ego_nodes(
+    sources: np.ndarray,
+    destinations: np.ndarray,
+    timestamps: np.ndarray,
+    target_user: int,
+    end_time: float,
+    n_layers: int,
+) -> Set[int]:
+    """
+    Tính tập node nằm trong L-hop temporal ego subgraph của target_user.
+    Chỉ hỗ trợ n_layers in (0, 1, 2). Nếu n_layers > 2 trả về set rỗng (caller dùng full graph).
+
+    Args:
+        sources, destinations, timestamps: Cạnh và thời gian
+        target_user: Node trung tâm
+        end_time: Chỉ xét cạnh có timestamp <= end_time
+        n_layers: Số layer (0 = chỉ target_user, 1 = + 1-hop, 2 = + 2-hop)
+
+    Returns:
+        Set các node id trong ego subgraph.
+    """
+    if n_layers < 0:
+        return set()
+    ego: Set[int] = {target_user}
+    if n_layers == 0:
+        return ego
+    # Chỉ tối ưu cho 1, 2 layer
+    n_hops = min(int(n_layers), 2)
+    for _ in range(n_hops):
+        next_ego = set(ego)
+        for i in range(len(sources)):
+            if timestamps[i] > end_time:
+                continue
+            s, d = int(sources[i]), int(destinations[i])
+            if s in ego:
+                next_ego.add(d)
+            if d in ego:
+                next_ego.add(s)
+        ego = next_ego
+    return ego
+
+
+def get_temporal_ego_subgraph(
+    sources: np.ndarray,
+    destinations: np.ndarray,
+    edge_idxs: np.ndarray,
+    timestamps: np.ndarray,
+    target_user: int,
+    end_time: float,
+    n_layers: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Lọc các cạnh thuộc L-hop temporal ego subgraph của target_user, giữ thứ tự thời gian.
+    Chỉ hỗ trợ n_layers in (0, 1, 2). Nếu n_layers > 2 trả về toàn bộ cạnh (không lọc).
+
+    Returns:
+        (sources_f, destinations_f, edge_idxs_f, timestamps_f) đã sort theo timestamps_f.
+    """
+    if n_layers < 0 or n_layers > 2:
+        return sources, destinations, edge_idxs, timestamps
+    ego = get_temporal_ego_nodes(sources, destinations, timestamps, target_user, end_time, n_layers)
+    # Cạnh cần giữ: timestamp <= end_time và ít nhất một đầu mút trong ego (để cập nhật memory và neighbor_finder)
+    mask = np.zeros(len(sources), dtype=bool)
+    for i in range(len(sources)):
+        if timestamps[i] <= end_time and (int(sources[i]) in ego or int(destinations[i]) in ego):
+            mask[i] = True
+    if not np.any(mask):
+        return (
+            np.array([], dtype=sources.dtype),
+            np.array([], dtype=destinations.dtype),
+            np.array([], dtype=edge_idxs.dtype),
+            np.array([], dtype=timestamps.dtype),
+        )
+    s_f = sources[mask]
+    d_f = destinations[mask]
+    e_f = edge_idxs[mask]
+    t_f = timestamps[mask]
+    order = np.argsort(t_f)
+    return s_f[order], d_f[order], e_f[order], t_f[order]
 
 
 def get_neighbor_finder(

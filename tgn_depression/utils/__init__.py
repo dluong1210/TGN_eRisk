@@ -7,7 +7,7 @@ try:
         collate_users
     )
     from .data_loader import load_depression_data, load_depression_data_from_parquet_folders, create_dummy_data
-    from .neighbor_finder import NeighborFinder, get_neighbor_finder
+    from .neighbor_finder import NeighborFinder, get_neighbor_finder, get_temporal_ego_nodes, get_temporal_ego_subgraph
     from .utils import (
         EarlyStopMonitor,
         MergeLayer,
@@ -24,7 +24,7 @@ except ImportError:
         collate_users
     )
     from data_loader import load_depression_data, load_depression_data_from_parquet_folders, create_dummy_data
-    from neighbor_finder import NeighborFinder, get_neighbor_finder
+    from neighbor_finder import NeighborFinder, get_neighbor_finder, get_temporal_ego_nodes, get_temporal_ego_subgraph
     from utils import (
         EarlyStopMonitor,
         MergeLayer,

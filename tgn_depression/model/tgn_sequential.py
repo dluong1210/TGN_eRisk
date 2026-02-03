@@ -26,7 +26,7 @@ try:
     from ..modules.memory_updater import get_memory_updater
     from ..modules.embedding_module import TimeEncode, get_embedding_module
     from ..utils.utils import ClassificationHead
-    from ..utils.neighbor_finder import get_neighbor_finder
+    from ..utils.neighbor_finder import get_neighbor_finder, get_temporal_ego_subgraph
 except ImportError:
     from modules.memory import Memory
     from modules.message_function import get_message_function
@@ -34,7 +34,7 @@ except ImportError:
     from modules.memory_updater import get_memory_updater
     from modules.embedding_module import TimeEncode, get_embedding_module
     from utils.utils import ClassificationHead
-    from utils.neighbor_finder import get_neighbor_finder
+    from utils.neighbor_finder import get_neighbor_finder, get_temporal_ego_subgraph
 
 
 class TGNSequential(nn.Module):
@@ -311,23 +311,24 @@ class TGNSequential(nn.Module):
     
     def process_conversation(self,
                              conversation,
-                             n_neighbors: int = None) -> torch.Tensor:
+                             n_neighbors: int = None,
+                             target_user: Optional[int] = None):
         """
-        Process a single conversation and return target user embedding.
+        Process a single conversation (neighbor_finder + memory), trả về end_time.
         
-        Tối ưu: Sử dụng conversation_batch_size để xử lý nhiều interactions cùng lúc.
+        Tối ưu: Nếu target_user và n_layers in (0,1,2) thì chỉ xử lý L-hop ego subgraph.
         
         Args:
             conversation: Conversation object
             n_neighbors: Number of neighbors to sample
+            target_user: Nếu có, dùng để lọc ego subgraph khi n_layers in (0,1,2)
         
         Returns:
-            Embedding of target user after this conversation [1, embedding_dim]
+            conversation.end_time (để gọi compute_user_embedding(target_user, end_time) sau)
         """
         if n_neighbors is None:
             n_neighbors = self.n_neighbors
         
-        # Get conversation data
         sources = conversation.source_users
         dests = conversation.dest_users
         timestamps = conversation.timestamps
@@ -336,48 +337,46 @@ class TGNSequential(nn.Module):
         if len(sources) == 0:
             return None
         
-        # Create neighbor finder for this conversation
+        end_time = conversation.end_time
+        sources_use, dests_use, edge_idxs_use, timestamps_use = sources, dests, post_ids, timestamps
+        if target_user is not None and 0 <= self.n_layers <= 2:
+            sources_use, dests_use, edge_idxs_use, timestamps_use = get_temporal_ego_subgraph(
+                sources, dests, post_ids, timestamps, target_user, end_time, self.n_layers
+            )
+        
         self.neighbor_finder = get_neighbor_finder(
-            sources=sources,
-            destinations=dests,
-            edge_idxs=post_ids,
-            timestamps=timestamps,
+            sources=sources_use,
+            destinations=dests_use,
+            edge_idxs=edge_idxs_use,
+            timestamps=timestamps_use,
             n_nodes=self.n_users,
             uniform=False
         )
         self._init_embedding_module()
         
-        # Process interactions in batches (tối ưu: batch_size lớn hơn để xử lý nhiều hơn)
         batch_size = self.conversation_batch_size
-        n_interactions = len(sources)
-        
-        # Tối ưu: nếu conversation nhỏ, xử lý toàn bộ trong 1 batch
+        n_interactions = len(sources_use)
         if n_interactions <= batch_size:
             batch_size = n_interactions
         
         for start_idx in range(0, n_interactions, batch_size):
             end_idx = min(start_idx + batch_size, n_interactions)
-            
-            batch_sources = sources[start_idx:end_idx]
-            batch_dests = dests[start_idx:end_idx]
-            batch_timestamps = timestamps[start_idx:end_idx]
-            batch_post_ids = post_ids[start_idx:end_idx]
-            
+            batch_sources = sources_use[start_idx:end_idx]
+            batch_dests = dests_use[start_idx:end_idx]
+            batch_timestamps = timestamps_use[start_idx:end_idx]
+            batch_post_ids = edge_idxs_use[start_idx:end_idx]
             if self.use_memory:
                 positives = np.concatenate([batch_sources, batch_dests])
                 unique_positives = np.unique(positives)
                 self.update_memory(unique_positives.tolist(), self.memory.messages)
                 self.memory.clear_messages(unique_positives.tolist())
-                
                 unique_sources, source_msgs, unique_dests, dest_msgs = self.get_raw_messages(
                     batch_sources, batch_dests, batch_timestamps, batch_post_ids
                 )
-                
                 self.memory.store_raw_messages(unique_sources, source_msgs)
                 self.memory.store_raw_messages(unique_dests, dest_msgs)
         
-        # Return embedding at end of conversation
-        return conversation.end_time
+        return end_time
     
     def process_conversations_batch(self,
                                     conversations: List,
@@ -439,29 +438,45 @@ class TGNSequential(nn.Module):
             if self.use_memory:
                 self.memory.__init_memory__()
             
-            # Tạo neighbor_finder riêng cho conversation này (QUAN TRỌNG: đảm bảo độc lập)
-            # Neighbor_finder chỉ chứa edges từ conversation này, không có edges từ conversations khác
+            # Tối ưu: chỉ dùng L-hop ego subgraph (layer 0,1,2) để tránh tính toán thừa
+            end_time = conv.end_time
+            sources_use = conv.source_users
+            dests_use = conv.dest_users
+            edge_idxs_use = conv.post_ids
+            timestamps_use = conv.timestamps
+            if 0 <= self.n_layers <= 2:
+                sources_use, dests_use, edge_idxs_use, timestamps_use = get_temporal_ego_subgraph(
+                    conv.source_users,
+                    conv.dest_users,
+                    conv.post_ids,
+                    conv.timestamps,
+                    target_user,
+                    end_time,
+                    self.n_layers,
+                )
+            
+            # Tạo neighbor_finder từ (có thể đã lọc) edges của conversation này
             self.neighbor_finder = get_neighbor_finder(
-                sources=conv.source_users,
-                destinations=conv.dest_users,
-                edge_idxs=conv.post_ids,
-                timestamps=conv.timestamps,
+                sources=sources_use,
+                destinations=dests_use,
+                edge_idxs=edge_idxs_use,
+                timestamps=timestamps_use,
                 n_nodes=self.n_users,
                 uniform=False
             )
             self._init_embedding_module()
             
-            # Process interactions của conversation này trong batches lớn (tối ưu GPU)
+            # Process interactions (chỉ ego subgraph khi n_layers in (0,1,2))
             batch_size = dynamic_batch_size
-            n_conv_interactions = len(conv.source_users)
+            n_conv_interactions = len(sources_use)
             
             for start_idx in range(0, n_conv_interactions, batch_size):
                 end_idx = min(start_idx + batch_size, n_conv_interactions)
                 
-                batch_sources = conv.source_users[start_idx:end_idx]
-                batch_dests = conv.dest_users[start_idx:end_idx]
-                batch_timestamps = conv.timestamps[start_idx:end_idx]
-                batch_post_ids = conv.post_ids[start_idx:end_idx]
+                batch_sources = sources_use[start_idx:end_idx]
+                batch_dests = dests_use[start_idx:end_idx]
+                batch_timestamps = timestamps_use[start_idx:end_idx]
+                batch_post_ids = edge_idxs_use[start_idx:end_idx]
                 
                 if self.use_memory:
                     positives = np.concatenate([batch_sources, batch_dests])
@@ -477,7 +492,6 @@ class TGNSequential(nn.Module):
                     self.memory.store_raw_messages(unique_dests, dest_msgs)
             
             # Lấy embedding tại end_time của conversation này
-            end_time = conv.end_time
             user_embedding = self.compute_user_embedding(
                 target_user, end_time, n_neighbors
             )
@@ -548,8 +562,8 @@ class TGNSequential(nn.Module):
             if conv.n_interactions == 0:
                 continue
             
-            # Process conversation (updates memory)
-            end_time = self.process_conversation(conv, n_neighbors)
+            # Process conversation (updates memory; ego subgraph khi n_layers in (0,1,2))
+            end_time = self.process_conversation(conv, n_neighbors, target_user=target_user)
             
             # Compute target user embedding sau conversation này
             user_embedding = self.compute_user_embedding(
@@ -632,8 +646,8 @@ class TGNSequential(nn.Module):
                 if self.use_memory:
                     self.memory.__init_memory__()
                 
-                # Process conversation (tạo neighbor_finder riêng và process interactions)
-                end_time = self.process_conversation(conv, n_neighbors)
+                # Process conversation (tạo neighbor_finder riêng; ego subgraph khi n_layers in (0,1,2))
+                end_time = self.process_conversation(conv, n_neighbors, target_user=target_user)
                 
                 # Compute target user embedding
                 user_embedding = self.compute_user_embedding(
@@ -727,6 +741,144 @@ class TGNSequential(nn.Module):
             all_logits.append(logits)
         
         # Stack: [batch_size, num_classes]
+        return torch.cat(all_logits, dim=0)
+    
+    def forward_merged_graph(self,
+                            batch_user_data: List,
+                            n_neighbors: int = None) -> torch.Tensor:
+        """
+        Forward pass trên MỘT graph lớn gộp từ nhiều users: gộp mọi conversation trong batch
+        thành một timeline events, chạy TGN một lần, snapshot embedding tại mỗi conversation end.
+        Nhanh hơn rất nhiều so với chạy TGN từng conversation / từng user.
+        
+        Hỗ trợ cả carryover và lstm mode.
+        
+        Args:
+            batch_user_data: List of UserData (cùng format như forward_batch_users)
+            n_neighbors: Number of neighbors
+        
+        Returns:
+            Logits [batch_size, num_classes]
+        """
+        try:
+            from ..utils.data_structures import merge_user_data_to_graph
+        except ImportError:
+            from utils.data_structures import merge_user_data_to_graph
+        
+        if n_neighbors is None:
+            n_neighbors = self.n_neighbors
+        
+        batch_size = len(batch_user_data)
+        if batch_size == 0:
+            return torch.zeros(0, 2).to(self.device)
+        
+        sources, destinations, timestamps, post_ids, conv_ends, user_ids, _ = \
+            merge_user_data_to_graph(batch_user_data)
+        
+        if len(sources) == 0:
+            zero_emb = torch.zeros(1, self.n_node_features).to(self.device)
+            if self.sequence_mode == 'lstm':
+                lstm_out, (h_n, c_n) = self.lstm(zero_emb.unsqueeze(0))
+                final_hidden = h_n[-1] if not self.lstm.bidirectional else torch.cat([h_n[-2], h_n[-1]], dim=-1)
+                if final_hidden.dim() == 1:
+                    final_hidden = final_hidden.unsqueeze(0)
+                logits = self.classifier(final_hidden)
+            else:
+                logits = self.classifier(zero_emb)
+            return logits.expand(batch_size, -1)
+        
+        self.reset_state()
+        self.neighbor_finder = get_neighbor_finder(
+            sources=sources,
+            destinations=destinations,
+            edge_idxs=post_ids,
+            timestamps=timestamps,
+            n_nodes=self.n_users,
+            uniform=False,
+        )
+        self._init_embedding_module()
+        
+        conv_ends_queue = list(conv_ends)
+        embeddings_per_user = [dict() for _ in range(batch_size)]  # user_idx_in_batch -> {conv_idx: tensor}
+        batch_sz = self.conversation_batch_size
+        event_idx = 0
+        n_events = len(sources)
+        
+        while event_idx < n_events:
+            next_conv_time = conv_ends_queue[0][0] if conv_ends_queue else float('inf')
+            j = event_idx
+            # Khi có conv end: lấy hết events với t <= next_conv_time (để snapshot đúng thời điểm)
+            # Khi không có: lấy tối đa batch_sz events
+            if next_conv_time != float('inf'):
+                while j < n_events and timestamps[j] <= next_conv_time:
+                    j += 1
+                if j == event_idx:
+                    # Không còn event nào có t <= next_conv_time → snapshot rồi xử lý event tiếp theo
+                    while conv_ends_queue and conv_ends_queue[0][0] <= next_conv_time:
+                        end_time, user_idx_in_batch, conv_idx = conv_ends_queue.pop(0)
+                        uid = user_ids[user_idx_in_batch]
+                        emb = self.compute_user_embedding(uid, end_time, n_neighbors)
+                        embeddings_per_user[user_idx_in_batch][conv_idx] = emb
+                    j = min(event_idx + 1, n_events)
+            else:
+                j = min(event_idx + batch_sz, n_events)
+            
+            batch_sources = sources[event_idx:j]
+            batch_dests = destinations[event_idx:j]
+            batch_timestamps = timestamps[event_idx:j]
+            batch_post_ids = post_ids[event_idx:j]
+            
+            if self.use_memory and len(batch_sources) > 0:
+                positives = np.concatenate([batch_sources, batch_dests])
+                unique_positives = np.unique(positives)
+                self.update_memory(unique_positives.tolist(), self.memory.messages)
+                self.memory.clear_messages(unique_positives.tolist())
+                unique_sources, source_msgs, unique_dests, dest_msgs = self.get_raw_messages(
+                    batch_sources, batch_dests, batch_timestamps, batch_post_ids
+                )
+                self.memory.store_raw_messages(unique_sources, source_msgs)
+                self.memory.store_raw_messages(unique_dests, dest_msgs)
+            
+            max_time_batch = float(batch_timestamps[-1]) if len(batch_timestamps) > 0 else float('-inf')
+            while conv_ends_queue and conv_ends_queue[0][0] <= max_time_batch:
+                end_time, user_idx_in_batch, conv_idx = conv_ends_queue.pop(0)
+                uid = user_ids[user_idx_in_batch]
+                emb = self.compute_user_embedding(uid, end_time, n_neighbors)
+                embeddings_per_user[user_idx_in_batch][conv_idx] = emb
+            
+            event_idx = j
+        
+        # Build logits per user từ embeddings_per_user
+        all_logits = []
+        zero_emb = torch.zeros(1, self.n_node_features).to(self.device)
+        
+        for user_idx_in_batch in range(batch_size):
+            conv_to_emb = embeddings_per_user[user_idx_in_batch]
+            if not conv_to_emb:
+                if self.sequence_mode == 'lstm':
+                    lstm_out, (h_n, c_n) = self.lstm(zero_emb.unsqueeze(0))
+                    final_hidden = h_n[-1] if not self.lstm.bidirectional else torch.cat([h_n[-2], h_n[-1]], dim=-1)
+                    if final_hidden.dim() == 1:
+                        final_hidden = final_hidden.unsqueeze(0)
+                    all_logits.append(self.classifier(final_hidden))
+                else:
+                    all_logits.append(self.classifier(zero_emb))
+                continue
+            
+            sorted_conv_idxs = sorted(conv_to_emb.keys())
+            conv_embeddings = [conv_to_emb[k] for k in sorted_conv_idxs]
+            seq = torch.cat(conv_embeddings, dim=0).unsqueeze(0)  # [1, n_conv, dim]
+            
+            if self.sequence_mode == 'lstm':
+                lstm_out, (h_n, c_n) = self.lstm(seq)
+                final_hidden = h_n[-1] if not self.lstm.bidirectional else torch.cat([h_n[-2], h_n[-1]], dim=-1)
+                if final_hidden.dim() == 1:
+                    final_hidden = final_hidden.unsqueeze(0)
+                all_logits.append(self.classifier(final_hidden))
+            else:
+                last_emb = seq[0, -1:, :]
+                all_logits.append(self.classifier(last_emb))
+        
         return torch.cat(all_logits, dim=0)
     
     def forward_user(self,
