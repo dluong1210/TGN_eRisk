@@ -270,15 +270,15 @@ class TGNSequential(nn.Module):
         dest_messages = defaultdict(list)
         
         for i in range(len(source_nodes)):
-            source_messages[source_nodes[i]].append(
+            source_messages[int(source_nodes[i])].append(
                 (source_message[i], edge_times_tensor[i])
             )
-            dest_messages[destination_nodes[i]].append(
+            dest_messages[int(destination_nodes[i])].append(
                 (dest_message[i], edge_times_tensor[i])
             )
-        
-        return (list(set(source_nodes)), source_messages,
-                list(set(destination_nodes)), dest_messages)
+        # np.unique nhanh hơn set cho array lớn, thứ tự ổn định
+        return (np.unique(source_nodes).tolist(), source_messages,
+                np.unique(destination_nodes).tolist(), dest_messages)
     
     def get_updated_memory(self, nodes: List[int], messages: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get updated memory without persisting."""
@@ -365,8 +365,9 @@ class TGNSequential(nn.Module):
             
             if self.use_memory:
                 positives = np.concatenate([batch_sources, batch_dests])
-                self.update_memory(positives.tolist(), self.memory.messages)
-                self.memory.clear_messages(positives.tolist())
+                unique_positives = np.unique(positives)
+                self.update_memory(unique_positives.tolist(), self.memory.messages)
+                self.memory.clear_messages(unique_positives.tolist())
                 
                 unique_sources, source_msgs, unique_dests, dest_msgs = self.get_raw_messages(
                     batch_sources, batch_dests, batch_timestamps, batch_post_ids
@@ -464,8 +465,9 @@ class TGNSequential(nn.Module):
                 
                 if self.use_memory:
                     positives = np.concatenate([batch_sources, batch_dests])
-                    self.update_memory(positives.tolist(), self.memory.messages)
-                    self.memory.clear_messages(positives.tolist())
+                    unique_positives = np.unique(positives)
+                    self.update_memory(unique_positives.tolist(), self.memory.messages)
+                    self.memory.clear_messages(unique_positives.tolist())
                     
                     unique_sources, source_msgs, unique_dests, dest_msgs = self.get_raw_messages(
                         batch_sources, batch_dests, batch_timestamps, batch_post_ids

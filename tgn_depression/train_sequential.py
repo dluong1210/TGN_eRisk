@@ -99,9 +99,12 @@ def train_epoch(model: TGNSequential,
         
         optimizer.zero_grad()
         
-        # Lấy user_data cho batch
+        # Lấy user_data cho batch (tensor trên device trực tiếp, tránh .to(device))
         batch_users_data = [dataset.users[user_idx] for user_idx in batch_indices]
-        batch_labels = torch.LongTensor([dataset.users[user_idx].label for user_idx in batch_indices]).to(device)
+        batch_labels = torch.tensor(
+            [dataset.users[user_idx].label for user_idx in batch_indices],
+            dtype=torch.long, device=device
+        )
         
         # Forward batch users (chỉ LSTM mode)
         if use_batch_forward and base_model.sequence_mode == 'lstm' and len(batch_indices) > 1:
@@ -121,44 +124,44 @@ def train_epoch(model: TGNSequential,
             # Loss đã là trung bình, nên nhân với batch_size để có total loss
             total_loss += loss.item() * len(batch_indices)
             n_users_processed += len(batch_indices)
-            
-            with torch.no_grad():
-                probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-                all_preds.extend(probs)
-                all_labels.extend(batch_labels.cpu().numpy().tolist())
+            # Một lần softmax + cpu (nhanh hơn)
+            with torch.inference_mode():
+                probs = torch.softmax(logits, dim=1)[:, 1]
+                all_preds.append(probs.cpu().numpy())
+                all_labels.append(batch_labels.cpu().numpy())
         else:
-            # Xử lý từng user (backward compatibility)
-            for step_in_batch, user_idx in enumerate(batch_indices):
+            # Xử lý từng user: gom logits rồi softmax một lần (giảm .cpu() và sync)
+            logits_list = []
+            batch_labels_list = []
+            for user_idx in batch_indices:
                 user_data = dataset.users[user_idx]
                 base_model.reset_state()
-                
-                label = torch.LongTensor([user_data.label]).to(device)
-                
                 logits = model(user_data, n_neighbors)
-                # CrossEntropyLoss với 1 sample vẫn tính đúng
-                loss = criterion(logits, label)
+                logits_list.append(logits)
+                batch_labels_list.append(user_data.label)
+                loss = criterion(logits, torch.tensor([user_data.label], dtype=torch.long, device=device))
                 loss.backward()
-                
                 base_model.detach_memory()
-                
                 total_loss += loss.item()
                 n_users_processed += 1
-                with torch.no_grad():
-                    probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-                    all_preds.extend(probs)
-                    all_labels.append(user_data.label)
+            if logits_list:
+                with torch.inference_mode():
+                    logits_cat = torch.cat(logits_list, dim=0)
+                    probs = torch.softmax(logits_cat, dim=1)[:, 1].cpu().numpy()
+                    all_preds.append(probs)
+                    all_labels.append(np.array(batch_labels_list, dtype=np.int64))
         
         # Update optimizer sau khi xử lý xong một batch user
         optimizer.step()
         
-        if rank == 0 and ((batch_start // user_batch_size) + 1) % 50 == 0:
+        if rank == 0 and ((batch_start // user_batch_size) + 1) % 100 == 0:
             logging.info(f"  Processed {batch_start + len(batch_indices)}/{len(indices)} users (rank 0)")
     
     avg_loss = total_loss / max(n_users_processed, 1)
     metrics = {}
-    if len(all_preds) > 0:
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
+    if all_preds:
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_labels = np.concatenate(all_labels, axis=0)
         pred_labels = (all_preds > 0.5).astype(int)
         metrics['accuracy'] = accuracy_score(all_labels, pred_labels)
         if len(np.unique(all_labels)) > 1:
@@ -177,37 +180,33 @@ def evaluate(model: TGNSequential,
              dataset: DepressionDataset,
              device: torch.device,
              n_neighbors: int = 10,
-             user_indices: Optional[List[int]] = None) -> Tuple[float, Dict]:
+             user_indices: Optional[List[int]] = None) -> Tuple[float, Dict, np.ndarray, np.ndarray]:
     """Evaluate model. If user_indices is set (DDP), only evaluate on those users."""
     model.eval()
     base_model = model.module if hasattr(model, 'module') else model
     criterion = nn.CrossEntropyLoss()
-    total_loss = 0
-    all_preds = []
-    all_labels = []
-    n_users_processed = 0
-    
+    total_loss = 0.0
     indices = user_indices if user_indices is not None else list(range(len(dataset.users)))
+    n_indices = len(indices)
+    # Pre-allocate (tránh list extend + một lần numpy)
+    preds_arr = np.empty(n_indices, dtype=np.float32)
+    labels_arr = np.empty(n_indices, dtype=np.int64)
     
-    with torch.no_grad():
-        for user_idx in indices:
+    with torch.inference_mode():
+        for i, user_idx in enumerate(indices):
             user_data = dataset.users[user_idx]
             base_model.reset_state()
-            label = torch.LongTensor([user_data.label]).to(device)
+            label = user_data.label
+            labels_arr[i] = label
+            label_t = torch.tensor([label], dtype=torch.long, device=device)
             logits = model(user_data, n_neighbors)
-            loss = criterion(logits, label)
-            total_loss += loss.item()
-            n_users_processed += 1
-            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            all_preds.extend(probs)
-            all_labels.append(user_data.label)
+            total_loss += criterion(logits, label_t).item()
+            preds_arr[i] = torch.softmax(logits, dim=1)[0, 1].item()
     
-    avg_loss = total_loss / max(n_users_processed, 1)
+    avg_loss = total_loss / max(n_indices, 1)
     metrics = {}
-    preds_arr = np.array(all_preds) if all_preds else np.array([])
-    labels_arr = np.array(all_labels) if all_labels else np.array([])
-    if len(all_preds) > 0:
-        pred_labels = (preds_arr > 0.5).astype(int)
+    if n_indices > 0:
+        pred_labels = (preds_arr > 0.5).astype(np.int32)
         metrics['accuracy'] = accuracy_score(labels_arr, pred_labels)
         if len(np.unique(labels_arr)) > 1:
             metrics['auc'] = roc_auc_score(labels_arr, preds_arr)
@@ -233,6 +232,8 @@ def main_worker(args,
     set_seed(args.seed + rank)
     if device is None:
         device = get_device(args.gpu)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     if rank == 0:
         logger.info(f"Using device: {device} (rank {rank}/{world_size})")
     
@@ -318,7 +319,7 @@ def main_worker(args,
         memory_updater_type=args.memory_updater,
         n_neighbors=args.n_neighbors,
         num_classes=2,
-        conversation_batch_size=getattr(args, "conversation_batch_size", 200)
+        conversation_batch_size=getattr(args, "conversation_batch_size", 500)
     ).to(device)
     
     if world_size > 1:
