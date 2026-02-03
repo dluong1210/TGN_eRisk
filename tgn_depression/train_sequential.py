@@ -17,6 +17,7 @@ import argparse
 import logging
 import os
 import time
+import inspect
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -88,9 +89,6 @@ def train_epoch(model: TGNSequential,
         user_data = dataset.users[user_idx]
         base_model.reset_state()
         
-        if user_data.total_interactions == 0:
-            continue
-        
         optimizer.zero_grad()
         label = torch.LongTensor([user_data.label]).to(device)
         logits = model(user_data, n_neighbors)
@@ -148,8 +146,6 @@ def evaluate(model: TGNSequential,
         for user_idx in indices:
             user_data = dataset.users[user_idx]
             base_model.reset_state()
-            if user_data.total_interactions == 0:
-                continue
             label = torch.LongTensor([user_data.label]).to(device)
             logits = model(user_data, n_neighbors)
             loss = criterion(logits, label)
@@ -232,6 +228,20 @@ def main_worker(args,
     
     logger.info("Training dataset:")
     train_dataset.print_statistics()
+
+    # IMPORTANT (DDP): remove empty users so every rank runs same #steps
+    # (otherwise some ranks may `continue` and collective ALLREDUCE can hang)
+    def _filter_nonempty(ds: DepressionDataset) -> DepressionDataset:
+        ds.users = [u for u in ds.users if u.total_interactions > 0]
+        return ds
+
+    train_dataset = _filter_nonempty(train_dataset)
+    val_dataset = _filter_nonempty(val_dataset)
+    test_dataset = _filter_nonempty(test_dataset)
+
+    if rank == 0:
+        logger.info("Training dataset (after filtering empty users):")
+        train_dataset.print_statistics()
     
     # Compute class weights
     train_labels = np.array([u.label for u in train_dataset.users])
@@ -264,7 +274,17 @@ def main_worker(args,
     ).to(device)
     
     if world_size > 1:
-        model = DDP(model, device_ids=[0], find_unused_parameters=True)
+        # Use explicit device_ids to avoid NCCL device mapping ambiguity
+        device_id = device.index if device.type == "cuda" else None
+        if device_id is None:
+            model = DDP(model, find_unused_parameters=True)
+        else:
+            model = DDP(
+                model,
+                device_ids=[device_id],
+                output_device=device_id,
+                find_unused_parameters=True,
+            )
     
     if rank == 0:
         logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -405,14 +425,29 @@ def main_worker(args,
 
 def worker_fn(rank: int, args, n_gpus: int, gpu_ids: List[int]):
     """Entry point for each GPU process (DDP)."""
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[rank])
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
-    # Set device before init_process_group (after CUDA_VISIBLE_DEVICES, cuda:0 is the only visible GPU)
-    device = torch.device("cuda:0")
-    torch.cuda.set_device(device)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=n_gpus)
-    dist.barrier()  # Ensure all ranks are ready before proceeding
+
+    # Map rank -> real GPU id explicitly (do NOT remap with CUDA_VISIBLE_DEVICES)
+    gpu_id = int(gpu_ids[rank])
+    device = torch.device(f"cuda:{gpu_id}") if torch.cuda.is_available() else torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(gpu_id)
+
+    # Init process group with explicit device_id when supported (PyTorch >= 2.2)
+    ipg_params = inspect.signature(dist.init_process_group).parameters
+    if "device_id" in ipg_params and device.type == "cuda":
+        dist.init_process_group(backend="nccl", rank=rank, world_size=n_gpus, device_id=gpu_id)
+    else:
+        dist.init_process_group(backend="nccl", rank=rank, world_size=n_gpus)
+
+    # Barrier with explicit device_ids when supported to avoid warning/hang
+    barrier_params = inspect.signature(dist.barrier).parameters
+    if "device_ids" in barrier_params and device.type == "cuda":
+        dist.barrier(device_ids=[gpu_id])
+    else:
+        dist.barrier()
+
     main_worker(args, device=device, rank=rank, world_size=n_gpus)
 
 
