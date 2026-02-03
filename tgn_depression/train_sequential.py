@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import gc
 import logging
 import os
 import time
@@ -116,8 +117,12 @@ def train_epoch(model: TGNSequential,
             with torch.inference_mode():
                 p = torch.softmax(logits, dim=1)[0, 1].detach().cpu().numpy().item()
             batch_probs.append(p)
+            del logits, loss
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         if device.type == "cuda":
             torch.cuda.empty_cache()
+            gc.collect()
         if batch_probs:
             all_preds.append(np.array(batch_probs, dtype=np.float32))
             all_labels.append(np.array(batch_labels_list, dtype=np.int64))
@@ -313,7 +318,8 @@ def main_worker(args,
         memory_updater_type=args.memory_updater,
         n_neighbors=args.n_neighbors,
         num_classes=2,
-        conversation_batch_size=getattr(args, "conversation_batch_size", 500)
+        conversation_batch_size=getattr(args, "conversation_batch_size", 500),
+        max_conversations_per_user=None if getattr(args, "max_conversations_per_user", 80) == -1 else getattr(args, "max_conversations_per_user", 80),
     ).to(device)
     
     if world_size > 1:
@@ -614,6 +620,8 @@ if __name__ == "__main__":
                     help='Memory updater type')
     parser.add_argument('--conversation_batch_size', type=int, default=200,
                     help='Batch size cho interactions trong mỗi conversation (TGNSequential)')
+    parser.add_argument('--max_conversations_per_user', type=int, default=80,
+                    help='Chỉ dùng K conversation gần nhất mỗi user để tránh OOM (user 166 conv → cap 80). -1 = không giới hạn.')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=50,
