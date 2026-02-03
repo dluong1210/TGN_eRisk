@@ -372,6 +372,93 @@ class TGNSequential(nn.Module):
         # Return embedding at end of conversation
         return conversation.end_time
     
+    def process_conversations_batch(self,
+                                    conversations: List,
+                                    target_user: int,
+                                    n_neighbors: int = None) -> List[torch.Tensor]:
+        """
+        Process multiple conversations efficiently (for LSTM mode).
+        
+        Xử lý từng conversation tuần tự nhưng tối ưu hóa bằng cách:
+        - Xử lý interactions trong batch lớn hơn (tận dụng GPU tốt hơn với conversation_batch_size)
+        - Reset memory giữa các conversations để đảm bảo độc lập
+        
+        QUAN TRỌNG: Mỗi conversation phải có neighbor_finder riêng để đảm bảo độc lập.
+        Không thể gom tất cả conversations lại vì neighbor_finder sẽ chứa edges từ
+        conversations khác, vi phạm tính độc lập của LSTM mode.
+        
+        Args:
+            conversations: List of Conversation objects (đã sorted theo thời gian)
+            target_user: Target user ID
+            n_neighbors: Number of neighbors to sample
+        
+        Returns:
+            List of embeddings [embedding_1, embedding_2, ...] tại end_time của mỗi conversation
+        """
+        if n_neighbors is None:
+            n_neighbors = self.n_neighbors
+        
+        if len(conversations) == 0:
+            return []
+        
+        # Filter out empty conversations
+        valid_convs = [c for c in conversations if c.n_interactions > 0]
+        if len(valid_convs) == 0:
+            return []
+        
+        # Xử lý từng conversation tuần tự (mỗi conversation độc lập về memory và neighbor_finder)
+        conversation_embeddings = []
+        
+        for conv in valid_convs:
+            # Reset memory trước mỗi conversation (đảm bảo độc lập)
+            if self.use_memory:
+                self.memory.__init_memory__()
+            
+            # Tạo neighbor_finder riêng cho conversation này (QUAN TRỌNG: đảm bảo độc lập)
+            # Neighbor_finder chỉ chứa edges từ conversation này, không có edges từ conversations khác
+            self.neighbor_finder = get_neighbor_finder(
+                sources=conv.source_users,
+                destinations=conv.dest_users,
+                edge_idxs=conv.post_ids,
+                timestamps=conv.timestamps,
+                n_nodes=self.n_users,
+                uniform=False
+            )
+            self._init_embedding_module()
+            
+            # Process interactions của conversation này trong batches lớn (tối ưu GPU)
+            batch_size = self.conversation_batch_size
+            n_conv_interactions = len(conv.source_users)
+            
+            for start_idx in range(0, n_conv_interactions, batch_size):
+                end_idx = min(start_idx + batch_size, n_conv_interactions)
+                
+                batch_sources = conv.source_users[start_idx:end_idx]
+                batch_dests = conv.dest_users[start_idx:end_idx]
+                batch_timestamps = conv.timestamps[start_idx:end_idx]
+                batch_post_ids = conv.post_ids[start_idx:end_idx]
+                
+                if self.use_memory:
+                    positives = np.concatenate([batch_sources, batch_dests])
+                    self.update_memory(positives.tolist(), self.memory.messages)
+                    self.memory.clear_messages(positives.tolist())
+                    
+                    unique_sources, source_msgs, unique_dests, dest_msgs = self.get_raw_messages(
+                        batch_sources, batch_dests, batch_timestamps, batch_post_ids
+                    )
+                    
+                    self.memory.store_raw_messages(unique_sources, source_msgs)
+                    self.memory.store_raw_messages(unique_dests, dest_msgs)
+            
+            # Lấy embedding tại end_time của conversation này
+            end_time = conv.end_time
+            user_embedding = self.compute_user_embedding(
+                target_user, end_time, n_neighbors
+            )
+            conversation_embeddings.append(user_embedding)
+        
+        return conversation_embeddings
+    
     def compute_user_embedding(self,
                                user_id: int,
                                timestamp: float,
@@ -464,7 +551,8 @@ class TGNSequential(nn.Module):
     
     def forward_lstm(self,
                      user_data,
-                     n_neighbors: int = None) -> torch.Tensor:
+                     n_neighbors: int = None,
+                     use_batch_processing: bool = True) -> torch.Tensor:
         """
         Forward pass using LSTM mode.
         
@@ -474,6 +562,7 @@ class TGNSequential(nn.Module):
         Args:
             user_data: UserData object
             n_neighbors: Number of neighbors
+            use_batch_processing: Nếu True, dùng process_conversations_batch (tối ưu với batch interactions)
         
         Returns:
             Logits [1, num_classes]
@@ -499,26 +588,32 @@ class TGNSequential(nn.Module):
             return self.classifier(final_hidden)
         
         # Collect embeddings from each conversation
-        conversation_embeddings = []
-        
-        for conv in conversations:
-            if conv.n_interactions == 0:
-                continue
-            
-            # Process conversation
-            end_time = self.process_conversation(conv, n_neighbors)
-            
-            # Compute target user embedding
-            user_embedding = self.compute_user_embedding(
-                target_user, end_time, n_neighbors
+        if use_batch_processing and len(conversations) > 1:
+            # Xử lý conversations với process_conversations_batch (tối ưu với batch interactions)
+            conversation_embeddings = self.process_conversations_batch(
+                conversations, target_user, n_neighbors
             )
+        else:
+            # Xử lý tuần tự từng conversation (backward compatibility)
+            conversation_embeddings = []
             
-            conversation_embeddings.append(user_embedding)
-            
-            # Reset memory for next conversation
-            # (Trong LSTM mode, mỗi conv được xử lý độc lập về memory)
-            if self.use_memory:
-                self.memory.__init_memory__()
+            for conv in conversations:
+                if conv.n_interactions == 0:
+                    continue
+                
+                # Reset memory trước mỗi conversation (QUAN TRỌNG: đảm bảo độc lập)
+                if self.use_memory:
+                    self.memory.__init_memory__()
+                
+                # Process conversation (tạo neighbor_finder riêng và process interactions)
+                end_time = self.process_conversation(conv, n_neighbors)
+                
+                # Compute target user embedding
+                user_embedding = self.compute_user_embedding(
+                    target_user, end_time, n_neighbors
+                )
+                
+                conversation_embeddings.append(user_embedding)
         
         if len(conversation_embeddings) == 0:
             zero_emb = torch.zeros(1, self.n_node_features).to(self.device)
@@ -558,6 +653,44 @@ class TGNSequential(nn.Module):
         """
         return self.forward_user(user_data, n_neighbors)
 
+    def forward_batch_users(self,
+                           users_data: List,
+                           n_neighbors: int = None) -> torch.Tensor:
+        """
+        Forward pass cho batch nhiều users (chỉ hỗ trợ LSTM mode).
+        
+        Xử lý tuần tự từng user nhưng gom kết quả để tính batch loss.
+        Mỗi user được reset state riêng để đảm bảo độc lập.
+        
+        Args:
+            users_data: List of UserData objects
+            n_neighbors: Number of neighbors
+        
+        Returns:
+            Logits [batch_size, num_classes]
+        """
+        if self.sequence_mode != 'lstm':
+            raise ValueError("forward_batch_users chỉ hỗ trợ LSTM mode")
+        
+        if n_neighbors is None:
+            n_neighbors = self.n_neighbors
+        
+        batch_size = len(users_data)
+        if batch_size == 0:
+            return torch.zeros(0, 2).to(self.device)
+        
+        # Xử lý tuần tự (AN TOÀN và vẫn nhanh nhờ batch gradient)
+        all_logits = []
+        
+        for user_data in users_data:
+            # Reset state cho mỗi user (quan trọng!)
+            self.reset_state()
+            logits = self.forward_lstm(user_data, n_neighbors)
+            all_logits.append(logits)
+        
+        # Stack: [batch_size, num_classes]
+        return torch.cat(all_logits, dim=0)
+    
     def forward_user(self,
                      user_data,
                      n_neighbors: int = None) -> torch.Tensor:

@@ -28,7 +28,6 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
-from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_fscore_support, accuracy_score
 
 from model.tgn_sequential import TGNSequential
@@ -76,9 +75,8 @@ def train_epoch(model: TGNSequential,
                 user_indices: Optional[List[int]] = None,
                 rank: int = 0,
                 world_size: int = 1,
-                scaler: Optional[GradScaler] = None,
                 user_batch_size: int = 1,
-                use_amp: bool = True) -> Tuple[float, Dict]:
+                use_batch_forward: bool = False) -> Tuple[float, Dict]:
     """Train for one epoch. If user_indices is set (DDP), only process those users."""
     model.train()
     base_model = model.module if hasattr(model, 'module') else model
@@ -99,41 +97,59 @@ def train_epoch(model: TGNSequential,
         
         optimizer.zero_grad()
         
-        for step_in_batch, user_idx in enumerate(batch_indices):
-            user_data = dataset.users[user_idx]
-            base_model.reset_state()
+        # Lấy user_data cho batch
+        batch_users_data = [dataset.users[user_idx] for user_idx in batch_indices]
+        batch_labels = torch.LongTensor([dataset.users[user_idx].label for user_idx in batch_indices]).to(device)
+        
+        # Forward batch users (chỉ LSTM mode)
+        if use_batch_forward and base_model.sequence_mode == 'lstm' and len(batch_indices) > 1:
+            # Xử lý batch users (forward_batch_users sẽ reset state cho mỗi user)
+            use_parallel_conv = getattr(args, "use_parallel_conversations", False)
+            max_workers = getattr(args, "max_workers", 4)
+            logits = base_model.forward_batch_users(
+                batch_users_data, n_neighbors,
+                use_parallel_conversations=use_parallel_conv,
+                max_workers=max_workers
+            )
+            # CrossEntropyLoss tự động tính trung bình trên batch, không cần normalize
+            loss = criterion(logits, batch_labels)
+            loss.backward()
             
-            label = torch.LongTensor([user_data.label]).to(device)
-            
-            # Mixed precision nếu có GPU
-            if scaler is not None and use_amp and device.type == "cuda":
-                with autocast():
-                    logits = model(user_data, n_neighbors)
-                    loss = criterion(logits, label)
-                    # Chia cho batch_size để loss là trung bình trên user
-                    loss = loss / len(batch_indices)
-                scaler.scale(loss).backward()
-            else:
-                logits = model(user_data, n_neighbors)
-                loss = criterion(logits, label)
-                loss = loss / len(batch_indices)
-                loss.backward()
-            
+            # Detach memory sau khi backward
             base_model.detach_memory()
             
-            total_loss += loss.item()
-            n_users_processed += 1
+            # Loss đã là trung bình, nên nhân với batch_size để có total loss
+            total_loss += loss.item() * len(batch_indices)
+            n_users_processed += len(batch_indices)
+            
             with torch.no_grad():
                 probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
                 all_preds.extend(probs)
-                all_labels.append(user_data.label)
-        
-        # Sau khi xử lý xong một batch user thì mới update optimizer
-        if scaler is not None and use_amp and device.type == "cuda":
-            scaler.step(optimizer)
-            scaler.update()
+                all_labels.extend(batch_labels.cpu().numpy().tolist())
         else:
-            optimizer.step()
+            # Xử lý từng user (backward compatibility)
+            for step_in_batch, user_idx in enumerate(batch_indices):
+                user_data = dataset.users[user_idx]
+                base_model.reset_state()
+                
+                label = torch.LongTensor([user_data.label]).to(device)
+                
+                logits = model(user_data, n_neighbors)
+                # CrossEntropyLoss với 1 sample vẫn tính đúng
+                loss = criterion(logits, label)
+                loss.backward()
+                
+                base_model.detach_memory()
+                
+                total_loss += loss.item()
+                n_users_processed += 1
+                with torch.no_grad():
+                    probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                    all_preds.extend(probs)
+                    all_labels.append(user_data.label)
+        
+        # Update optimizer sau khi xử lý xong một batch user
+        optimizer.step()
         
         if rank == 0 and ((batch_start // user_batch_size) + 1) % 50 == 0:
             logging.info(f"  Processed {batch_start + len(batch_indices)}/{len(indices)} users (rank 0)")
@@ -323,8 +339,6 @@ def main_worker(args,
     
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    # Mixed precision scaler (chỉ dùng khi có CUDA)
-    scaler = GradScaler(enabled=(device.type == "cuda"))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.5, patience=3
     )
@@ -360,9 +374,8 @@ def main_worker(args,
             user_indices=train_indices,
             rank=rank,
             world_size=world_size,
-            scaler=scaler,
             user_batch_size=getattr(args, "user_batch_size", 1),
-            use_amp=getattr(args, "use_amp", True)
+            use_batch_forward=getattr(args, "use_batch_forward", False)
         )
         
         val_loss, val_metrics, val_preds, val_labels = evaluate(
@@ -591,8 +604,8 @@ if __name__ == "__main__":
                         help='Comma-separated GPU IDs for multi-GPU (e.g. 0,1 for 2x T4)')
     parser.add_argument('--user_batch_size', type=int, default=1,
                         help='Số lượng user xử lý trước mỗi lần optimizer.step()')
-    parser.add_argument('--use_amp', action='store_true',
-                        help='Dùng mixed-precision (AMP) trên GPU để tăng tốc')
+    parser.add_argument('--use_batch_forward', action='store_true',
+                        help='Xử lý batch users trong LSTM mode (gom gradient của nhiều users)')
     
     # Output arguments
     parser.add_argument('--save_dir', type=str, default='./saved_models',
