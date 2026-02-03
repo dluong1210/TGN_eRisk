@@ -408,8 +408,11 @@ def worker_fn(rank: int, args, n_gpus: int, gpu_ids: List[int]):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[rank])
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
+    # Set device before init_process_group (after CUDA_VISIBLE_DEVICES, cuda:0 is the only visible GPU)
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
     dist.init_process_group(backend="nccl", rank=rank, world_size=n_gpus)
-    device = get_device_for_rank(0, gpu_ids)
+    dist.barrier()  # Ensure all ranks are ready before proceeding
     main_worker(args, device=device, rank=rank, world_size=n_gpus)
 
 
