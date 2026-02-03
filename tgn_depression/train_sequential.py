@@ -374,8 +374,8 @@ def main_worker(args,
             user_indices=train_indices,
             rank=rank,
             world_size=world_size,
-            user_batch_size=getattr(args, "user_batch_size", 1),
-            use_batch_forward=getattr(args, "use_batch_forward", False)
+            user_batch_size=getattr(args, "user_batch_size", 4),
+            use_batch_forward=getattr(args, "use_batch_forward", True)
         )
         
         val_loss, val_metrics, val_preds, val_labels = evaluate(
@@ -602,10 +602,10 @@ if __name__ == "__main__":
                         help='Train on multiple GPUs (DDP)')
     parser.add_argument('--gpu_ids', type=str, default='0,1',
                         help='Comma-separated GPU IDs for multi-GPU (e.g. 0,1 for 2x T4)')
-    parser.add_argument('--user_batch_size', type=int, default=1,
-                        help='Số lượng user xử lý trước mỗi lần optimizer.step()')
-    parser.add_argument('--use_batch_forward', action='store_true',
-                        help='Xử lý batch users trong LSTM mode (gom gradient của nhiều users)')
+    parser.add_argument('--user_batch_size', type=int, default=4,
+                        help='Số lượng user xử lý trước mỗi lần optimizer.step(). Tăng lên 4-8 để tối ưu tốc độ.')
+    parser.add_argument('--use_batch_forward', action='store_true', default=True,
+                        help='Xử lý batch users trong LSTM mode (gom gradient của nhiều users). Mặc định True để tối ưu.')
     
     # Output arguments
     parser.add_argument('--save_dir', type=str, default='./saved_models',

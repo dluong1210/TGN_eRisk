@@ -315,6 +315,8 @@ class TGNSequential(nn.Module):
         """
         Process a single conversation and return target user embedding.
         
+        Tối ưu: Sử dụng conversation_batch_size để xử lý nhiều interactions cùng lúc.
+        
         Args:
             conversation: Conversation object
             n_neighbors: Number of neighbors to sample
@@ -345,9 +347,13 @@ class TGNSequential(nn.Module):
         )
         self._init_embedding_module()
         
-        # Process interactions in batches
+        # Process interactions in batches (tối ưu: batch_size lớn hơn để xử lý nhiều hơn)
         batch_size = self.conversation_batch_size
         n_interactions = len(sources)
+        
+        # Tối ưu: nếu conversation nhỏ, xử lý toàn bộ trong 1 batch
+        if n_interactions <= batch_size:
+            batch_size = n_interactions
         
         for start_idx in range(0, n_interactions, batch_size):
             end_idx = min(start_idx + batch_size, n_interactions)
@@ -375,13 +381,15 @@ class TGNSequential(nn.Module):
     def process_conversations_batch(self,
                                     conversations: List,
                                     target_user: int,
-                                    n_neighbors: int = None) -> List[torch.Tensor]:
+                                    n_neighbors: int = None,
+                                    use_larger_batches: bool = True) -> List[torch.Tensor]:
         """
         Process multiple conversations efficiently (for LSTM mode).
         
-        Xử lý từng conversation tuần tự nhưng tối ưu hóa bằng cách:
+        Tối ưu hóa:
         - Xử lý interactions trong batch lớn hơn (tận dụng GPU tốt hơn với conversation_batch_size)
         - Reset memory giữa các conversations để đảm bảo độc lập
+        - Với use_larger_batches=True: tăng batch_size động dựa trên số lượng conversations
         
         QUAN TRỌNG: Mỗi conversation phải có neighbor_finder riêng để đảm bảo độc lập.
         Không thể gom tất cả conversations lại vì neighbor_finder sẽ chứa edges từ
@@ -391,6 +399,7 @@ class TGNSequential(nn.Module):
             conversations: List of Conversation objects (đã sorted theo thời gian)
             target_user: Target user ID
             n_neighbors: Number of neighbors to sample
+            use_larger_batches: Nếu True, tăng batch_size động để xử lý nhiều interactions hơn
         
         Returns:
             List of embeddings [embedding_1, embedding_2, ...] tại end_time của mỗi conversation
@@ -405,6 +414,21 @@ class TGNSequential(nn.Module):
         valid_convs = [c for c in conversations if c.n_interactions > 0]
         if len(valid_convs) == 0:
             return []
+        
+        # Tối ưu: tăng batch_size động nếu có nhiều conversations nhỏ
+        base_batch_size = self.conversation_batch_size
+        if use_larger_batches and len(valid_convs) > 1:
+            # Tính tổng interactions và điều chỉnh batch_size
+            total_interactions = sum(len(c.source_users) for c in valid_convs)
+            avg_interactions_per_conv = total_interactions / len(valid_convs)
+            # Nếu conversations nhỏ, tăng batch_size để xử lý nhiều hơn
+            if avg_interactions_per_conv < base_batch_size:
+                # Tăng batch_size lên 2-4x nếu conversations nhỏ
+                dynamic_batch_size = min(base_batch_size * 2, max(base_batch_size, total_interactions // len(valid_convs) + 100))
+            else:
+                dynamic_batch_size = base_batch_size
+        else:
+            dynamic_batch_size = base_batch_size
         
         # Xử lý từng conversation tuần tự (mỗi conversation độc lập về memory và neighbor_finder)
         conversation_embeddings = []
@@ -427,7 +451,7 @@ class TGNSequential(nn.Module):
             self._init_embedding_module()
             
             # Process interactions của conversation này trong batches lớn (tối ưu GPU)
-            batch_size = self.conversation_batch_size
+            batch_size = dynamic_batch_size
             n_conv_interactions = len(conv.source_users)
             
             for start_idx in range(0, n_conv_interactions, batch_size):
@@ -590,8 +614,9 @@ class TGNSequential(nn.Module):
         # Collect embeddings from each conversation
         if use_batch_processing and len(conversations) > 1:
             # Xử lý conversations với process_conversations_batch (tối ưu với batch interactions)
+            # Sử dụng larger batches để tối ưu hóa tốc độ
             conversation_embeddings = self.process_conversations_batch(
-                conversations, target_user, n_neighbors
+                conversations, target_user, n_neighbors, use_larger_batches=True
             )
         else:
             # Xử lý tuần tự từng conversation (backward compatibility)
@@ -655,16 +680,25 @@ class TGNSequential(nn.Module):
 
     def forward_batch_users(self,
                            users_data: List,
-                           n_neighbors: int = None) -> torch.Tensor:
+                           n_neighbors: int = None,
+                           use_parallel_conversations: bool = False,
+                           max_workers: int = 4) -> torch.Tensor:
         """
         Forward pass cho batch nhiều users (chỉ hỗ trợ LSTM mode).
         
         Xử lý tuần tự từng user nhưng gom kết quả để tính batch loss.
         Mỗi user được reset state riêng để đảm bảo độc lập.
         
+        Tối ưu hóa:
+        - Sử dụng batch processing cho conversations (tăng conversation_batch_size động)
+        - use_parallel_conversations: Hiện tại chưa hỗ trợ true parallelism (do CUDA context),
+          nhưng có thể tối ưu bằng cách tăng batch sizes
+        
         Args:
             users_data: List of UserData objects
             n_neighbors: Number of neighbors
+            use_parallel_conversations: (Reserved for future use) Parallel conversation processing
+            max_workers: (Reserved for future use) Max workers for parallel processing
         
         Returns:
             Logits [batch_size, num_classes]
@@ -680,12 +714,14 @@ class TGNSequential(nn.Module):
             return torch.zeros(0, 2).to(self.device)
         
         # Xử lý tuần tự (AN TOÀN và vẫn nhanh nhờ batch gradient)
+        # Tối ưu: sử dụng batch processing với larger batches
         all_logits = []
         
         for user_data in users_data:
             # Reset state cho mỗi user (quan trọng!)
             self.reset_state()
-            logits = self.forward_lstm(user_data, n_neighbors)
+            # Sử dụng batch processing với larger batches để tối ưu
+            logits = self.forward_lstm(user_data, n_neighbors, use_batch_processing=True)
             all_logits.append(logits)
         
         # Stack: [batch_size, num_classes]
