@@ -121,6 +121,9 @@ def train_epoch(model: TGNSequential,
             all_preds.append(probs)
             all_labels.append(batch_labels.cpu().numpy().copy())
             del logits, probs, batch_labels
+            # Giải phóng VRAM ngay sau mỗi batch (batch 40 user + 166 conv/user dễ tràn)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         else:
             # Nhánh tiết kiệm VRAM: từng user, accumulate gradient rồi step 1 lần.
             n_in_batch = len(batch_indices)
@@ -145,9 +148,10 @@ def train_epoch(model: TGNSequential,
         
         optimizer.step()
         
-        # Giải phóng cache GPU định kỳ (không quá dày để tránh chậm)
-        if device.type == "cuda" and (batch_start // user_batch_size + 1) % 200 == 0:
-            torch.cuda.empty_cache()
+        # Giải phóng cache GPU định kỳ (batch forward đã gọi empty_cache mỗi batch)
+        if device.type == "cuda" and not (use_batch_forward and base_model.sequence_mode == 'lstm' and len(batch_indices) > 1):
+            if (batch_start // user_batch_size + 1) % 50 == 0:
+                torch.cuda.empty_cache()
         
         if rank == 0 and ((batch_start // user_batch_size) + 1) % 100 == 0:
             logging.info(f"  Processed {batch_start + len(batch_indices)}/{len(indices)} users (rank 0)")
@@ -378,6 +382,15 @@ def main_worker(args,
         user_batch_size = min(user_batch_size, 4)
         if rank == 0:
             logger.info(f"DDP: capping user_batch_size to {user_batch_size} per GPU to reduce OOM risk.")
+    # Dataset lớn (n_total_users lớn, nhiều conversation/user): giảm batch để tránh CPU 100% và VRAM tăng
+    avg_conv = getattr(train_dataset, "avg_conversations_per_user", 0) or 0
+    n_total = metadata.get("n_total_users", 0) or getattr(train_dataset, "n_total_users", 0)
+    if rank == 0 and n_total > 10000 and avg_conv > 50 and user_batch_size > 8:
+        suggested = min(user_batch_size, 8)
+        logger.info(
+            f"Dataset lớn (n_total_users={n_total}, avg_conversations_per_user={avg_conv:.0f}). "
+            f"Gợi ý: --user_batch_size {suggested} nếu CPU 100%% hoặc VRAM tăng (hiện tại {user_batch_size})."
+        )
     
     if rank == 0:
         logger.info("Starting training...")

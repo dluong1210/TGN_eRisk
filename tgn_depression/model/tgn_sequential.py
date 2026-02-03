@@ -44,6 +44,10 @@ class TGNSequential(nn.Module):
     Supports two modes:
     1. 'carryover': Carry target user's embedding to next conversation
     2. 'lstm': Collect embeddings from each conversation, process with LSTM
+    
+    Tối ưu: Chỉ cần embedding của target_user nên khi n_layers in (0,1,2) chỉ tính
+    L-hop ego (1-hop khi n_layers=1; 1+2-hop khi n_layers=2). Không cập nhật memory
+    hay build neighbor_finder cho toàn bộ graph — chỉ edges/nodes trong ego.
     """
     
     def __init__(self,
@@ -339,6 +343,7 @@ class TGNSequential(nn.Module):
         
         end_time = conversation.end_time
         sources_use, dests_use, edge_idxs_use, timestamps_use = sources, dests, post_ids, timestamps
+        # Chỉ dùng L-hop ego (1-hop khi n_layers=1, 1+2-hop khi n_layers=2) — không tính toàn graph
         if target_user is not None and 0 <= self.n_layers <= 2:
             sources_use, dests_use, edge_idxs_use, timestamps_use = get_temporal_ego_subgraph(
                 sources, dests, post_ids, timestamps, target_user, end_time, self.n_layers
@@ -444,6 +449,7 @@ class TGNSequential(nn.Module):
             dests_use = conv.dest_users
             edge_idxs_use = conv.post_ids
             timestamps_use = conv.timestamps
+            # Chỉ dùng L-hop ego — không build graph toàn bộ conversation
             if 0 <= self.n_layers <= 2:
                 sources_use, dests_use, edge_idxs_use, timestamps_use = get_temporal_ego_subgraph(
                     conv.source_users,
@@ -455,7 +461,7 @@ class TGNSequential(nn.Module):
                     self.n_layers,
                 )
             
-            # Tạo neighbor_finder từ (có thể đã lọc) edges của conversation này
+            # NeighborFinder chỉ chứa edges trong ego
             self.neighbor_finder = get_neighbor_finder(
                 sources=sources_use,
                 destinations=dests_use,
@@ -503,7 +509,10 @@ class TGNSequential(nn.Module):
                                user_id: int,
                                timestamp: float,
                                n_neighbors: int = None) -> torch.Tensor:
-        """Compute embedding for a user at given timestamp."""
+        """
+        Compute embedding for a user at given timestamp.
+        Chỉ cần memory cho nodes trong L-hop ego (có pending messages) — không duyệt toàn bộ n_users.
+        """
         if n_neighbors is None:
             n_neighbors = self.n_neighbors
         
@@ -511,9 +520,9 @@ class TGNSequential(nn.Module):
         timestamps = np.array([timestamp])
         
         if self.use_memory:
-            memory, _ = self.get_updated_memory(
-                list(range(self.n_users)), self.memory.messages
-            )
+            # Chỉ aggregate/update memory cho nodes có pending messages (chỉ node trong ego)
+            nodes_with_messages = list(self.memory.messages.keys()) if self.memory.messages else []
+            memory, _ = self.get_updated_memory(nodes_with_messages, self.memory.messages)
         else:
             memory = None
         
