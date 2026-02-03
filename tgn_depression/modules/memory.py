@@ -1,10 +1,3 @@
-"""
-Memory Module for TGN.
-
-Memory lưu trữ trạng thái của mỗi node (user) và được update
-sau mỗi interaction.
-"""
-
 import torch
 import torch.nn as nn
 from collections import defaultdict
@@ -23,33 +16,20 @@ class Memory(nn.Module):
                  n_nodes: int,
                  memory_dimension: int,
                  device: torch.device = torch.device('cpu')):
-        """
-        Args:
-            n_nodes: Total number of nodes (users)
-            memory_dimension: Dimension of memory vectors
-            device: Device to store memory on
-        """
         super(Memory, self).__init__()
         
         self.n_nodes = n_nodes
         self.memory_dimension = memory_dimension
         self.device = device
         
-        # Initialize memory
         self.__init_memory__()
     
     def __init_memory__(self):
-        """
-        Initialize memory to zeros.
-        Called at the start of each epoch or when processing new conversation.
-        """
-        # Memory vectors for each node
         self.memory = nn.Parameter(
             torch.zeros((self.n_nodes, self.memory_dimension)).to(self.device),
             requires_grad=False
         )
         
-        # Last update timestamp for each node
         self.last_update = nn.Parameter(
             torch.zeros(self.n_nodes).to(self.device),
             requires_grad=False
@@ -72,17 +52,9 @@ class Memory(nn.Module):
         return self.memory[node_idxs, :]
     
     def set_memory(self, node_idxs, values: torch.Tensor):
-        """
-        Set memory values for specified nodes.
-        
-        Args:
-            node_idxs: Node indices
-            values: New memory values
-        """
         self.memory[node_idxs, :] = values
     
     def get_last_update(self, node_idxs) -> torch.Tensor:
-        """Get last update timestamps for nodes."""
         return self.last_update[node_idxs]
     
     def store_raw_messages(self, 

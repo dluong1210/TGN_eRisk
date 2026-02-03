@@ -50,9 +50,7 @@ class TimeEncode(nn.Module):
             Time encoding [batch_size, seq_len, dimension] or [batch_size, dimension]
         """
         # Add dimension for linear layer
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)
-        elif t.dim() == 2:
+        if t.dim() == 1 or t.dim() == 2:
             t = t.unsqueeze(-1)
         
         # Apply linear transformation and cosine

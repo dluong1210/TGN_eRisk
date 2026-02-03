@@ -180,70 +180,12 @@ python train_sequential.py \
 - `--lr`: Learning rate (default: 0.0001)
 - `--patience`: Early stopping patience (default: 5)
 
-## Training Flow
-
-For each TARGET USER:
-
-```
-1. Reset Memory → Initialize all user memories to zeros
-
-2. Get ALL conversations of target user (sorted by time)
-
-3. Get ALL interactions across ALL conversations (sorted by time)
-
-4. Process interactions in batches:
-   ┌────────────────────────────────────────────────────┐
-   │ For each batch of interactions:                    │
-   │   - Update memory from previous batch's messages   │
-   │   - Store new messages for next batch              │
-   └────────────────────────────────────────────────────┘
-
-5. Compute target user embedding at final timestamp
-   using temporal graph attention
-
-6. Classify: MLP(embedding) → P(depression)
-
-7. Loss + Backprop
-```
-
-## Example
-
-```python
-from model.tgn_depression import TGNDepression
-from utils.neighbor_finder import UserNeighborFinder
-
-# Initialize model
-model = TGNDepression(
-    n_users=1000,
-    edge_features=post_embeddings,
-    device=device,
-    n_layers=1,
-    use_memory=True,
-    memory_dimension=768
-)
-
-# For each target user
-for user_data in dataset:
-    # Reset memory
-    model.reset_memory()
-    
-    # Create neighbor finder from ALL user's conversations
-    neighbor_finder = UserNeighborFinder(user_data, n_users=1000)
-    model.set_neighbor_finder(neighbor_finder)
-    
-    # Forward pass - processes ALL conversations
-    logits = model.forward_user(user_data)
-    
-    # Get prediction
-    prob_depression = torch.softmax(logits, dim=1)[0, 1]
-```
-
 ## Project Structure
 
 ```
 tgn_depression/
-├── model/
-│   └── tgn_depression.py      # Main TGN model
+├── model/                     # Sequential TGN models
+│   └── tgn_sequential.py      # TGNSequential, TGNCarryOver, TGNLstm
 ├── modules/
 │   ├── memory.py              # Memory module
 │   ├── message_function.py    # Message creation
@@ -255,8 +197,8 @@ tgn_depression/
 │   ├── data_loader.py         # Data loading
 │   ├── neighbor_finder.py     # Temporal neighbor sampling
 │   └── utils.py               # Helper functions
-├── train.py                   # Training script
-├── test_model.py              # Test script
+├── train_sequential.py        # Training script for sequential models
+├── test_sequential.py         # Test script for sequential models
 └── README.md
 ```
 

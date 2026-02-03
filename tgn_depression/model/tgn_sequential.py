@@ -64,11 +64,12 @@ class TGNSequential(nn.Module):
                  memory_dimension: int = 172,
                  message_dimension: int = 100,
                  embedding_module_type: str = "graph_attention",
-                 message_function_type: str = "identity",
-                 aggregator_type: str = "last",
-                 memory_updater_type: str = "gru",
-                 n_neighbors: int = 10,
-                 num_classes: int = 2):
+                     message_function_type: str = "identity",
+                     aggregator_type: str = "last",
+                     memory_updater_type: str = "gru",
+                     n_neighbors: int = 10,
+                     num_classes: int = 2,
+                     conversation_batch_size: int = 200):
         """
         Args:
             sequence_mode: 'carryover' hoặc 'lstm'
@@ -88,6 +89,7 @@ class TGNSequential(nn.Module):
         self.use_memory = use_memory
         self.sequence_mode = sequence_mode
         self.logger = logging.getLogger(__name__)
+        self.conversation_batch_size = conversation_batch_size
         
         assert sequence_mode in ['carryover', 'lstm'], \
             f"sequence_mode must be 'carryover' or 'lstm', got {sequence_mode}"
@@ -341,7 +343,7 @@ class TGNSequential(nn.Module):
         self._init_embedding_module()
         
         # Process interactions in batches
-        batch_size = 200
+        batch_size = self.conversation_batch_size
         n_interactions = len(sources)
         
         for start_idx in range(0, n_interactions, batch_size):

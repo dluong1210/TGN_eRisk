@@ -28,6 +28,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
+from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_fscore_support, accuracy_score
 
 from model.tgn_sequential import TGNSequential
@@ -74,7 +75,10 @@ def train_epoch(model: TGNSequential,
                 n_neighbors: int = 10,
                 user_indices: Optional[List[int]] = None,
                 rank: int = 0,
-                world_size: int = 1) -> Tuple[float, Dict]:
+                world_size: int = 1,
+                scaler: Optional[GradScaler] = None,
+                user_batch_size: int = 1,
+                use_amp: bool = True) -> Tuple[float, Dict]:
     """Train for one epoch. If user_indices is set (DDP), only process those users."""
     model.train()
     base_model = model.module if hasattr(model, 'module') else model
@@ -85,27 +89,54 @@ def train_epoch(model: TGNSequential,
     
     indices = user_indices if user_indices is not None else list(range(len(dataset.users)))
     
-    for step, user_idx in enumerate(indices):
-        user_data = dataset.users[user_idx]
-        base_model.reset_state()
+    # Batching theo user: gom nhiều user trước khi update optimizer
+    user_batch_size = max(1, int(user_batch_size))
+    
+    for batch_start in range(0, len(indices), user_batch_size):
+        batch_indices = indices[batch_start:batch_start + user_batch_size]
+        if len(batch_indices) == 0:
+            continue
         
         optimizer.zero_grad()
-        label = torch.LongTensor([user_data.label]).to(device)
-        logits = model(user_data, n_neighbors)
-        loss = criterion(logits, label)
-        loss.backward()
-        optimizer.step()
-        base_model.detach_memory()
         
-        total_loss += loss.item()
-        n_users_processed += 1
-        with torch.no_grad():
-            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            all_preds.extend(probs)
-            all_labels.append(user_data.label)
+        for step_in_batch, user_idx in enumerate(batch_indices):
+            user_data = dataset.users[user_idx]
+            base_model.reset_state()
+            
+            label = torch.LongTensor([user_data.label]).to(device)
+            
+            # Mixed precision nếu có GPU
+            if scaler is not None and use_amp and device.type == "cuda":
+                with autocast():
+                    logits = model(user_data, n_neighbors)
+                    loss = criterion(logits, label)
+                    # Chia cho batch_size để loss là trung bình trên user
+                    loss = loss / len(batch_indices)
+                scaler.scale(loss).backward()
+            else:
+                logits = model(user_data, n_neighbors)
+                loss = criterion(logits, label)
+                loss = loss / len(batch_indices)
+                loss.backward()
+            
+            base_model.detach_memory()
+            
+            total_loss += loss.item()
+            n_users_processed += 1
+            with torch.no_grad():
+                probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                all_preds.extend(probs)
+                all_labels.append(user_data.label)
         
-        if rank == 0 and (step + 1) % 50 == 0:
-            logging.info(f"  Processed {step + 1}/{len(indices)} users (rank 0)")
+        # Sau khi xử lý xong một batch user thì mới update optimizer
+        if scaler is not None and use_amp and device.type == "cuda":
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        
+        if rank == 0 and ((batch_start // user_batch_size) + 1) % 50 == 0:
+            logging.info(f"  Processed {batch_start + len(batch_indices)}/{len(indices)} users (rank 0)")
     
     avg_loss = total_loss / max(n_users_processed, 1)
     metrics = {}
@@ -270,7 +301,8 @@ def main_worker(args,
         aggregator_type=args.aggregator,
         memory_updater_type=args.memory_updater,
         n_neighbors=args.n_neighbors,
-        num_classes=2
+        num_classes=2,
+        conversation_batch_size=getattr(args, "conversation_batch_size", 200)
     ).to(device)
     
     if world_size > 1:
@@ -291,6 +323,8 @@ def main_worker(args,
     
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Mixed precision scaler (chỉ dùng khi có CUDA)
+    scaler = GradScaler(enabled=(device.type == "cuda"))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.5, patience=3
     )
@@ -325,7 +359,10 @@ def main_worker(args,
             n_neighbors=args.n_neighbors,
             user_indices=train_indices,
             rank=rank,
-            world_size=world_size
+            world_size=world_size,
+            scaler=scaler,
+            user_batch_size=getattr(args, "user_batch_size", 1),
+            use_amp=getattr(args, "use_amp", True)
         )
         
         val_loss, val_metrics, val_preds, val_labels = evaluate(
@@ -530,8 +567,10 @@ if __name__ == "__main__":
                         choices=['last', 'mean'],
                         help='Message aggregator type')
     parser.add_argument('--memory_updater', type=str, default='gru',
-                        choices=['gru', 'rnn'],
-                        help='Memory updater type')
+                    choices=['gru', 'rnn'],
+                    help='Memory updater type')
+    parser.add_argument('--conversation_batch_size', type=int, default=200,
+                    help='Batch size cho interactions trong mỗi conversation (TGNSequential)')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=50,
@@ -550,6 +589,10 @@ if __name__ == "__main__":
                         help='Train on multiple GPUs (DDP)')
     parser.add_argument('--gpu_ids', type=str, default='0,1',
                         help='Comma-separated GPU IDs for multi-GPU (e.g. 0,1 for 2x T4)')
+    parser.add_argument('--user_batch_size', type=int, default=1,
+                        help='Số lượng user xử lý trước mỗi lần optimizer.step()')
+    parser.add_argument('--use_amp', action='store_true',
+                        help='Dùng mixed-precision (AMP) trên GPU để tăng tốc')
     
     # Output arguments
     parser.add_argument('--save_dir', type=str, default='./saved_models',

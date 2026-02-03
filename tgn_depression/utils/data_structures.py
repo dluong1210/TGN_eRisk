@@ -69,39 +69,13 @@ class UserData:
         return sum(c.n_interactions for c in self.conversations)
     
     def get_conversations_sorted(self) -> List[Conversation]:
-        """Return conversations sorted by start time."""
-        return sorted(self.conversations, key=lambda c: c.start_time)
-    
-    def get_all_interactions(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Get all interactions across all conversations, sorted by time.
+        Return conversations in the stored order.
         
-        Returns:
-            sources, destinations, timestamps, post_ids
+        NOTE: We intentionally do NOT sort conversations by time here.
+        The conversation sequence is assumed to follow the order in the input data.
         """
-        all_sources = []
-        all_dests = []
-        all_timestamps = []
-        all_post_ids = []
-        
-        for conv in self.get_conversations_sorted():
-            all_sources.append(conv.source_users)
-            all_dests.append(conv.dest_users)
-            all_timestamps.append(conv.timestamps)
-            all_post_ids.append(conv.post_ids)
-        
-        if len(all_sources) == 0:
-            return np.array([]), np.array([]), np.array([]), np.array([])
-        
-        sources = np.concatenate(all_sources)
-        dests = np.concatenate(all_dests)
-        timestamps = np.concatenate(all_timestamps)
-        post_ids = np.concatenate(all_post_ids)
-        
-        # Sort by timestamp
-        sort_idx = np.argsort(timestamps)
-        
-        return sources[sort_idx], dests[sort_idx], timestamps[sort_idx], post_ids[sort_idx]
+        return list(self.conversations)
     
     def get_evaluation_time(self) -> float:
         """Thời điểm cuối cùng để evaluate user."""

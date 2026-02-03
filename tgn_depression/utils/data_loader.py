@@ -250,9 +250,8 @@ def load_depression_data(
         
         user_idx = user_to_idx[target_user_str]
         convs = user_conversations.get(user_idx, [])
-        
-        # Sort conversations by start time
-        convs = sorted(convs, key=lambda c: c.start_time)
+        # IMPORTANT: Do NOT sort conversations here.
+        # The conversation sequence is assumed to follow the order in the input data.
         
         user_data = UserData(
             user_id=user_idx,
@@ -466,7 +465,8 @@ def load_depression_data_from_parquet_folders(
         
         # Group by conversation_id
         conversations_list: List[Conversation] = []
-        for conv_id, group in df.groupby("conversation_id"):
+        # IMPORTANT: Keep conversation order as it appears in the file (no sorting by conversation_id).
+        for conv_id, group in df.groupby("conversation_id", sort=False):
             group = group.sort_values("timestamp").reset_index(drop=True)
             rows_valid = []
             for _, row in group.iterrows():
@@ -498,8 +498,8 @@ def load_depression_data_from_parquet_folders(
                 post_ids=post_ids
             )
             conversations_list.append(conv)
-        
-        conversations_list = sorted(conversations_list, key=lambda c: c.start_time)
+        # IMPORTANT: Do NOT sort conversations_list.
+        # The conversation sequence is assumed to follow the order in the input data.
         
         user_data = UserData(
             user_id=user_idx,
@@ -703,7 +703,8 @@ def create_dummy_data(
     all_user_data = []
     for user_idx, label in target_labels.items():
         convs = user_to_conversations.get(user_idx, [])
-        convs = sorted(convs, key=lambda c: c.start_time)
+        # IMPORTANT: Do NOT sort conversations here.
+        # The conversation sequence is assumed to follow the generation / input order.
         
         user_data = UserData(
             user_id=user_idx,
