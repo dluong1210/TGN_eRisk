@@ -371,7 +371,7 @@ def main_worker(args,
     
     if rank == 0:
         logger.info("Starting training...")
-    best_val_auc = 0
+    best_val_f1 = 0.0
     best_epoch = 0
     
     for epoch in range(args.epochs):
@@ -418,7 +418,7 @@ def main_worker(args,
             max_size = max(s.item() for s in size_list)
             if max_size == 0:
                 val_metrics = {}
-                val_auc = 0.0
+                val_f1 = 0.0
             else:
                 if preds_t.shape[0] == 0:
                     preds_t = torch.zeros(max_size, dtype=torch.float32).to(device)
@@ -443,12 +443,12 @@ def main_worker(args,
                         }
                         pr, rc, _, _ = precision_recall_fscore_support(all_labels, (all_preds > 0.5).astype(int), average='binary', zero_division=0)
                         val_metrics['precision'], val_metrics['recall'] = pr, rc
-                val_auc_local = val_metrics.get('auc', 0.0)
-                val_auc_t = torch.tensor([val_auc_local], dtype=torch.float32).to(device)
-                dist.broadcast(val_auc_t, src=0)
-                val_auc = val_auc_t.item()
+                val_f1_local = val_metrics.get('f1', 0.0)
+                val_f1_t = torch.tensor([val_f1_local], dtype=torch.float32).to(device)
+                dist.broadcast(val_f1_t, src=0)
+                val_f1 = val_f1_t.item()
         else:
-            val_auc = val_metrics.get('auc', 0)
+            val_f1 = val_metrics.get('f1', 0.0)
         
         epoch_time = time.time() - epoch_start
         
@@ -457,17 +457,17 @@ def main_worker(args,
             logger.info(f"  Train Loss: {train_loss:.4f}, Metrics: {train_metrics}")
             logger.info(f"  Val Loss: {val_loss:.4f}, Metrics: {val_metrics}")
         
-        scheduler.step(val_auc)
+        scheduler.step(val_f1)
         
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
             best_epoch = epoch + 1
             if rank == 0:
                 save_model = model.module if hasattr(model, 'module') else model
                 torch.save(save_model.state_dict(), f"{args.save_dir}/best_model_{args.sequence_mode}.pth")
-                logger.info(f"  New best model saved! (AUC: {val_auc:.4f})")
+                logger.info(f"  New best model saved! (F1: {val_f1:.4f})")
         
-        if early_stopper.early_stop_check(val_auc):
+        if early_stopper.early_stop_check(val_f1):
             if rank == 0:
                 logger.info(f"Early stopping triggered after {epoch + 1} epochs")
             break
@@ -477,14 +477,14 @@ def main_worker(args,
         if not Path(best_path).exists():
             save_model = model.module if hasattr(model, 'module') else model
             torch.save(save_model.state_dict(), best_path)
-            logger.info("No best model saved (val AUC did not improve); saved last model.")
-        logger.info(f"\nBest model saved: {best_path} (epoch {best_epoch}, val AUC: {best_val_auc:.4f})")
+            logger.info("No best model saved (val F1 did not improve); saved last model.")
+        logger.info(f"\nBest model saved: {best_path} (epoch {best_epoch}, val F1: {best_val_f1:.4f})")
         
         import json
         results = {
             'sequence_mode': args.sequence_mode,
             'best_epoch': best_epoch,
-            'best_val_auc': best_val_auc,
+            'best_val_f1': best_val_f1,
             'args': vars(args)
         }
         with open(f"{args.save_dir}/results_{args.sequence_mode}.json", 'w') as f:
