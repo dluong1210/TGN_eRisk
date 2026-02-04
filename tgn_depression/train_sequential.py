@@ -15,20 +15,14 @@ Usage:
 
 import argparse
 import gc
+import json
 import logging
-import os
 import time
-import inspect
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset
-from torch.utils.data.distributed import DistributedSampler
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_fscore_support, accuracy_score
 
 from model.tgn_sequential import TGNSequential
@@ -41,23 +35,73 @@ from utils.data_loader import (
 from utils.utils import EarlyStopMonitor, set_seed, get_device, compute_class_weights
 
 
-class IndexDataset(Dataset):
-    """Dataset of indices for DistributedSampler (split users across GPUs)."""
-    def __init__(self, n: int):
-        self.n = n
-    def __len__(self) -> int:
-        return self.n
-    def __getitem__(self, idx: int) -> int:
-        return idx
+def slice_positive_users(
+    dataset: DepressionDataset,
+    window_size: int,
+    overlap: int,
+) -> DepressionDataset:
+    """
+    Với user có label=1 (dương tính), slice chuỗi conversations thành nhiều sample
+    theo sliding window: window_size conversations/sample, overlap conversations giữa 2 window.
+    Ví dụ: window_size=100, overlap=10 → [0:100], [90:190], [180:280], ...
+    Xử lý:
+    - len(conversations) < window_size: giữ 1 sample với toàn bộ conversations (không slice).
+    - Sample cuối khi slice có thể ít hơn window_size (partial window) — vẫn giữ.
+    - overlap phải < window_size; nếu không thì dùng overlap = window_size - 1.
+    """
+    if window_size < 1:
+        return dataset
+    step = window_size - overlap
+    if step < 1:
+        overlap = max(0, window_size - 1)
+        step = 1
+
+    new_users: List[UserData] = []
+    for u in dataset.users:
+        if u.label == 0:
+            new_users.append(u)
+            continue
+        convs = u.get_conversations_sorted()
+        n = len(convs)
+        if n < window_size:
+            # Quá ít conversation: giữ nguyên 1 sample (không slice)
+            new_users.append(u)
+            continue
+        # Sliding window: [0, step, 2*step, ...]; mỗi window [start : start+window_size], cho phép window cuối ngắn hơn
+        start = 0
+        while start < n:
+            end = min(start + window_size, n)
+            window_convs = convs[start:end]
+            if len(window_convs) == 0:
+                break
+            new_users.append(
+                UserData(
+                    user_id=u.user_id,
+                    user_id_str=u.user_id_str,
+                    conversations=window_convs,
+                    label=1,
+                )
+            )
+            if end >= n:
+                break
+            start += step
+
+    return DepressionDataset(
+        users=new_users,
+        post_embeddings=dataset.post_embeddings,
+        n_total_users=dataset.n_total_users,
+        user_to_idx=dataset.user_to_idx,
+        idx_to_user=dataset.idx_to_user,
+    )
 
 
-def setup_logging(log_dir: str = "logs", rank: int = 0):
-    """Setup logging. When rank > 0 (DDP), only StreamHandler to avoid multiple processes writing same file."""
-    if rank == 0:
-        Path(log_dir).mkdir(parents=True, exist_ok=True)
-    handlers = [logging.StreamHandler()]
-    if rank == 0:
-        handlers.append(logging.FileHandler(f'{log_dir}/train_seq_{int(time.time())}.log'))
+def setup_logging(log_dir: str = "logs"):
+    """Setup logging to console and file."""
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    handlers = [
+        logging.StreamHandler(),
+        logging.FileHandler(f'{log_dir}/train_seq_{int(time.time())}.log'),
+    ]
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -73,22 +117,16 @@ def train_epoch(model: TGNSequential,
                 criterion: nn.Module,
                 device: torch.device,
                 n_neighbors: int = 10,
-                user_indices: Optional[List[int]] = None,
-                rank: int = 0,
-                world_size: int = 1,
-                user_batch_size: int = 1,
-                use_batch_forward: bool = False,
-                use_parallel_conversations: bool = False,
-                max_workers: int = 4) -> Tuple[float, Dict]:
-    """Train for one epoch. If user_indices is set (DDP), only process those users."""
+                user_batch_size: int = 1) -> Tuple[float, Dict]:
+    """Train for one epoch."""
     model.train()
     base_model = model.module if hasattr(model, 'module') else model
     total_loss = 0
     all_preds = []
     all_labels = []
     n_users_processed = 0
-    
-    indices = user_indices if user_indices is not None else list(range(len(dataset.users)))
+
+    indices = list(range(len(dataset.users)))
     
     # Batching theo user: gom nhiều user trước khi update optimizer
     user_batch_size = max(1, int(user_batch_size))
@@ -128,9 +166,9 @@ def train_epoch(model: TGNSequential,
             all_labels.append(np.array(batch_labels_list, dtype=np.int64))
         
         optimizer.step()
-        
-        if rank == 0 and ((batch_start // user_batch_size) + 1) % 100 == 0:
-            logging.info(f"  Processed {batch_start + len(batch_indices)}/{len(indices)} users (rank 0)")
+
+        if ((batch_start // user_batch_size) + 1) % 100 == 0:
+            logging.info(f"  Processed {batch_start + len(batch_indices)}/{len(indices)} users")
     
     avg_loss = total_loss / max(n_users_processed, 1)
     if device.type == "cuda":
@@ -157,15 +195,13 @@ def evaluate(model: TGNSequential,
              dataset: DepressionDataset,
              device: torch.device,
              n_neighbors: int = 10,
-             user_indices: Optional[List[int]] = None,
              eval_batch_size: int = 1) -> Tuple[float, Dict, np.ndarray, np.ndarray]:
-    """Evaluate model. If user_indices is set (DDP), only evaluate on those users.
-    eval_batch_size > 1 (LSTM mode) gom nhiều user một forward để eval nhanh hơn."""
+    """Evaluate model. eval_batch_size > 1 (LSTM mode) gom nhiều user một forward để eval nhanh hơn."""
     model.eval()
     base_model = model.module if hasattr(model, 'module') else model
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
-    indices = user_indices if user_indices is not None else list(range(len(dataset.users)))
+    indices = list(range(len(dataset.users)))
     n_indices = len(indices)
     preds_arr = np.empty(n_indices, dtype=np.float32)
     labels_arr = np.empty(n_indices, dtype=np.int64)
@@ -215,32 +251,22 @@ def evaluate(model: TGNSequential,
     return avg_loss, metrics, preds_arr, labels_arr
 
 
-def main_worker(args,
-                device: Optional[torch.device] = None,
-                rank: int = 0,
-                world_size: int = 1):
-    """Main training function. When world_size > 1, runs under DDP (device/rank set by spawn)."""
-    logger = setup_logging(args.log_dir, rank=rank)
-    if rank == 0:
-        logger.info(f"Arguments: {args}")
-        logger.info(f"Sequence mode: {args.sequence_mode.upper()}")
-    
-    set_seed(args.seed + rank)
+def main_worker(args, device: Optional[torch.device] = None):
+    """Main training function (single GPU)."""
+    logger = setup_logging(args.log_dir)
+    logger.info(f"Arguments: {args}")
+    logger.info(f"Sequence mode: {args.sequence_mode.upper()}")
+
+    set_seed(args.seed)
     if device is None:
         device = get_device(args.gpu)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    if rank == 0:
-        logger.info(f"Using device: {device} (rank {rank}/{world_size})")
-    
-    if rank == 0:
-        Path(args.save_dir).mkdir(parents=True, exist_ok=True)
-    if world_size > 1:
-        dist.barrier()
-    
-    # Load data (chỉ rank 0 in log/print để tránh trùng khi DDP)
-    if rank == 0:
-        logger.info("Loading data...")
+    logger.info(f"Using device: {device}")
+
+    Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+
+    logger.info("Loading data...")
     if args.use_dummy_data:
         train_dataset, val_dataset, test_dataset, metadata = create_dummy_data(
             n_total_users=args.n_total_users,
@@ -256,27 +282,27 @@ def main_worker(args,
             data_dir=args.data_dir,
             neg_folder=args.neg_folder,
             pos_folder=args.pos_folder,
-            val_ratio=0.15,
-            test_ratio=0.0,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
             split_method=args.split_method,
             seed=args.seed,
             max_ego_hops=None if getattr(args, "max_ego_hops", 2) < 0 else getattr(args, "max_ego_hops", 2),
-            verbose=(rank == 0),
+            verbose=True,
         )
     else:
         train_dataset, val_dataset, test_dataset, metadata = load_depression_data(
             interactions_path=f"{args.data_dir}/interactions.csv",
             embeddings_path=f"{args.data_dir}/embeddings.json",
             labels_path=f"{args.data_dir}/labels.json",
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
             split_method=args.split_method,
             seed=args.seed
         )
     
-    if rank == 0:
-        logger.info("Training dataset:")
-        train_dataset.print_statistics(verbose=True)
+    logger.info("Training dataset:")
+    train_dataset.print_statistics(verbose=True)
 
-    # IMPORTANT (DDP): remove empty users so every rank runs same #steps
     def _filter_nonempty(ds: DepressionDataset) -> DepressionDataset:
         ds.users = [u for u in ds.users if u.total_interactions > 0]
         return ds
@@ -285,21 +311,26 @@ def main_worker(args,
     val_dataset = _filter_nonempty(val_dataset)
     test_dataset = _filter_nonempty(test_dataset)
 
-    if rank == 0:
-        logger.info("Training dataset (after filtering empty users):")
+    logger.info("Training dataset (after filtering empty users):")
+    train_dataset.print_statistics(verbose=True)
+
+    # Slice positive users theo window_size / overlap (chỉ train)
+    if getattr(args, 'positive_window_size', None) and args.positive_window_size >= 1:
+        overlap = getattr(args, 'positive_overlap', 0) or 0
+        logger.info(f"Slicing positive users: window_size={args.positive_window_size}, overlap={overlap}")
+        train_dataset = slice_positive_users(train_dataset, args.positive_window_size, overlap)
+        logger.info("Training dataset (after slicing positive users):")
         train_dataset.print_statistics(verbose=True)
-        train_pos = np.mean([u.label for u in train_dataset.users])
-        val_pos = np.mean([u.label for u in val_dataset.users])
-        logger.info(f"Train pos ratio: {train_pos:.4f}, Val pos ratio: {val_pos:.4f} (baseline predict-all-1 F1≈{2*val_pos/(1+val_pos):.4f})")
-    
-    # Compute class weights
+
+    train_pos = np.mean([u.label for u in train_dataset.users])
+    val_pos = np.mean([u.label for u in val_dataset.users])
+    logger.info(f"Train pos ratio: {train_pos:.4f}, Val pos ratio: {val_pos:.4f} (baseline predict-all-1 F1≈{2*val_pos/(1+val_pos):.4f})")
+
     train_labels = np.array([u.label for u in train_dataset.users])
     class_weights = compute_class_weights(train_labels).to(device).float()
-    if rank == 0:
-        logger.info(f"Class weights: {class_weights}")
-    
-    if rank == 0:
-        logger.info(f"Initializing TGN Sequential model ({args.sequence_mode} mode)...")
+    logger.info(f"Class weights: {class_weights}")
+
+    logger.info(f"Initializing TGN Sequential model ({args.sequence_mode} mode)...")
     model = TGNSequential(
         n_users=metadata['n_total_users'],
         edge_features=train_dataset.post_embeddings,
@@ -325,22 +356,8 @@ def main_worker(args,
         max_conversations_per_user=None if getattr(args, "max_conversations_per_user", 80) == -1 else getattr(args, "max_conversations_per_user", 80),
         use_carryover_grad=getattr(args, "use_carryover_grad", True),
     ).to(device)
-    
-    if world_size > 1:
-        # Use explicit device_ids to avoid NCCL device mapping ambiguity
-        device_id = device.index if device.type == "cuda" else None
-        if device_id is None:
-            model = DDP(model, find_unused_parameters=True)
-        else:
-            model = DDP(
-                model,
-                device_ids=[device_id],
-                output_device=device_id,
-                find_unused_parameters=True,
-            )
-    
-    if rank == 0:
-        logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -348,41 +365,22 @@ def main_worker(args,
         optimizer, mode='max', factor=0.5, patience=3
     )
     early_stopper = EarlyStopMonitor(max_round=args.patience, higher_better=True)
-    
-    train_index_ds = IndexDataset(len(train_dataset.users))
-    val_index_ds = IndexDataset(len(val_dataset.users))
-    train_sampler = DistributedSampler(train_index_ds, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
-    val_sampler = DistributedSampler(val_index_ds, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
-    
-    train_indices = list(train_sampler) if train_sampler is not None else None
-    val_indices = list(val_sampler) if val_sampler is not None else None
-    
-    # DDP: giới hạn user_batch_size để tránh OOM (mỗi GPU xử lý batch nhỏ hơn)
+
     user_batch_size = getattr(args, "user_batch_size", 4)
-    if world_size > 1 and getattr(args, "use_batch_forward", True):
-        user_batch_size = min(user_batch_size, 4)
-        if rank == 0:
-            logger.info(f"DDP: capping user_batch_size to {user_batch_size} per GPU to reduce OOM risk.")
-    # Dataset lớn (n_total_users lớn, nhiều conversation/user): giảm batch để tránh CPU 100% và VRAM tăng
     avg_conv = getattr(train_dataset, "avg_conversations_per_user", 0) or 0
     n_total = metadata.get("n_total_users", 0) or getattr(train_dataset, "n_total_users", 0)
-    if rank == 0 and n_total > 10000 and avg_conv > 50 and user_batch_size > 8:
+    if n_total > 10000 and avg_conv > 50 and user_batch_size > 8:
         suggested = min(user_batch_size, 8)
         logger.info(
             f"Dataset lớn (n_total_users={n_total}, avg_conversations_per_user={avg_conv:.0f}). "
             f"Gợi ý: --user_batch_size {suggested} nếu CPU 100%% hoặc VRAM tăng (hiện tại {user_batch_size})."
         )
-    
-    if rank == 0:
-        logger.info("Starting training...")
+
+    logger.info("Starting training...")
     best_val_auc = 0.0
     best_epoch = 0
     
     for epoch in range(args.epochs):
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-            train_indices = list(train_sampler)
-        
         epoch_start = time.time()
         train_start = time.time()
         train_loss, train_metrics = train_epoch(
@@ -392,168 +390,87 @@ def main_worker(args,
             criterion=criterion,
             device=device,
             n_neighbors=args.n_neighbors,
-            user_indices=train_indices,
-            rank=rank,
-            world_size=world_size,
             user_batch_size=user_batch_size,
-            use_batch_forward=getattr(args, "use_batch_forward", True),
-            use_parallel_conversations=getattr(args, "use_parallel_conversations", False),
-            max_workers=getattr(args, "max_workers", 4),
         )
         train_time = time.time() - train_start
 
         eval_start = time.time()
-        val_loss, val_metrics, val_preds, val_labels = evaluate(
+        val_loss, val_metrics, _, _ = evaluate(
             model=model,
             dataset=val_dataset,
             device=device,
             n_neighbors=args.n_neighbors,
-            user_indices=val_indices,
             eval_batch_size=getattr(args, "eval_batch_size", 8),
         )
         eval_time = time.time() - eval_start
-        
-        if world_size > 1:
-            preds_t = torch.from_numpy(val_preds.astype(np.float32)).to(device)
-            labels_t = torch.from_numpy(val_labels.astype(np.int64)).to(device)
-            local_size = torch.tensor([preds_t.shape[0]], dtype=torch.long).to(device)
-            size_list = [torch.zeros(1, dtype=torch.long).to(device) for _ in range(world_size)]
-            dist.all_gather(size_list, local_size)
-            max_size = max(s.item() for s in size_list)
-            if max_size == 0:
-                val_metrics = {}
-                val_auc = 0.0
-            else:
-                if preds_t.shape[0] == 0:
-                    preds_t = torch.zeros(max_size, dtype=torch.float32).to(device)
-                    labels_t = torch.full((max_size,), -1, dtype=torch.int64).to(device)
-                elif preds_t.shape[0] < max_size:
-                    preds_t = torch.nn.functional.pad(preds_t, (0, max_size - preds_t.shape[0]), value=0)
-                    labels_t = torch.nn.functional.pad(labels_t, (0, max_size - labels_t.shape[0]), value=-1)
-                preds_list = [torch.zeros_like(preds_t).to(device) for _ in range(world_size)]
-                labels_list = [torch.zeros_like(labels_t).to(device) for _ in range(world_size)]
-                dist.all_gather(preds_list, preds_t)
-                dist.all_gather(labels_list, labels_t)
-                if rank == 0:
-                    all_preds = torch.cat([p[:s.item()] for p, s in zip(preds_list, size_list)], dim=0).cpu().numpy()
-                    all_labels = torch.cat([l[:s.item()] for l, s in zip(labels_list, size_list)], dim=0).cpu().numpy()
-                    valid = all_labels >= 0
-                    all_preds, all_labels = all_preds[valid], all_labels[valid]
-                    if len(all_preds) > 0 and len(np.unique(all_labels)) > 1:
-                        val_metrics = {
-                            'accuracy': accuracy_score(all_labels, (all_preds > 0.5).astype(int)),
-                            'auc': roc_auc_score(all_labels, all_preds),
-                            'f1': f1_score(all_labels, (all_preds > 0.5).astype(int))
-                        }
-                        pr, rc, _, _ = precision_recall_fscore_support(all_labels, (all_preds > 0.5).astype(int), average='binary', zero_division=0)
-                        val_metrics['precision'], val_metrics['recall'] = pr, rc
-                val_auc_local = val_metrics.get('auc', 0.0)
-                val_auc_t = torch.tensor([val_auc_local], dtype=torch.float32).to(device)
-                dist.broadcast(val_auc_t, src=0)
-                val_auc = val_auc_t.item()
-        else:
-            val_auc = val_metrics.get('auc', 0.0)
-        
+
+        val_auc = val_metrics.get('auc', 0.0)
         epoch_time = time.time() - epoch_start
-        
-        if rank == 0:
-            logger.info(f"Epoch {epoch + 1}/{args.epochs} ({epoch_time:.1f}s) train={train_time:.1f}s eval={eval_time:.1f}s")
-            logger.info(f"  Train Loss: {train_loss:.4f}, Metrics: {train_metrics}")
-            logger.info(f"  Val Loss: {val_loss:.4f}, Metrics: {val_metrics}")
-        
+
+        logger.info(f"Epoch {epoch + 1}/{args.epochs} ({epoch_time:.1f}s) train={train_time:.1f}s eval={eval_time:.1f}s")
+        logger.info(f"  Train Loss: {train_loss:.4f}, Metrics: {train_metrics}")
+        logger.info(f"  Val Loss: {val_loss:.4f}, Metrics: {val_metrics}")
+
         scheduler.step(val_auc)
-        
+
         if val_auc > best_val_auc:
             best_val_auc = val_auc
             best_epoch = epoch + 1
-            if rank == 0:
-                save_model = model.module if hasattr(model, 'module') else model
-                torch.save(save_model.state_dict(), f"{args.save_dir}/best_model_{args.sequence_mode}.pth")
-                logger.info(f"  New best model saved! (AUC: {val_auc:.4f})")
-        
-        if early_stopper.early_stop_check(val_auc):
-            if rank == 0:
-                logger.info(f"Early stopping triggered after {epoch + 1} epochs")
-            break
-    
-    best_path = f"{args.save_dir}/best_model_{args.sequence_mode}.pth"
-    if rank == 0:
-        if not Path(best_path).exists():
             save_model = model.module if hasattr(model, 'module') else model
-            torch.save(save_model.state_dict(), best_path)
-            logger.info("No best model saved (val F1 did not improve); saved last model.")
-        logger.info(f"\nBest model saved: {best_path} (epoch {best_epoch}, val AUC: {best_val_auc:.4f})")
-        
-        import json
-        results = {
-            'sequence_mode': args.sequence_mode,
-            'best_epoch': best_epoch,
-            'best_val_auc': best_val_auc,
-            'args': vars(args)
-        }
-        with open(f"{args.save_dir}/results_{args.sequence_mode}.json", 'w') as f:
-            json.dump(results, f, indent=2)
-        logger.info(f"Results saved to {args.save_dir}/results_{args.sequence_mode}.json")
+            torch.save(save_model.state_dict(), f"{args.save_dir}/best_model_{args.sequence_mode}.pth")
+            logger.info(f"  New best model saved! (AUC: {val_auc:.4f})")
+
+        if early_stopper.early_stop_check(val_auc):
+            logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+            break
+
+    best_path = f"{args.save_dir}/best_model_{args.sequence_mode}.pth"
+    if not Path(best_path).exists():
+        save_model = model.module if hasattr(model, 'module') else model
+        torch.save(save_model.state_dict(), best_path)
+        logger.info("No best model saved (val AUC did not improve); saved last model.")
+    logger.info(f"\nBest model saved: {best_path} (epoch {best_epoch}, val AUC: {best_val_auc:.4f})")
+
+    # Đánh giá trên test set (pipeline train + test)
+    test_metrics = None
+    if len(test_dataset.users) > 0:
+        logger.info("Evaluating on test set...")
+        save_model = model.module if hasattr(model, 'module') else model
+        save_model.load_state_dict(torch.load(best_path, map_location=device))
+        test_loss, test_metrics, _, _ = evaluate(
+            model=model,
+            dataset=test_dataset,
+            device=device,
+            n_neighbors=args.n_neighbors,
+            eval_batch_size=getattr(args, "eval_batch_size", 8),
+        )
+        logger.info(f"Test Loss: {test_loss:.4f}, Test Metrics: {test_metrics}")
+    else:
+        logger.info("No test set (test_ratio=0); skip test evaluation.")
+
+    results = {
+        'sequence_mode': args.sequence_mode,
+        'best_epoch': best_epoch,
+        'best_val_auc': best_val_auc,
+        'args': vars(args)
+    }
+    if test_metrics is not None:
+        results['test_metrics'] = test_metrics
+    with open(f"{args.save_dir}/results_{args.sequence_mode}.json", 'w') as f:
+        json.dump(results, f, indent=2)
+    logger.info(f"Results saved to {args.save_dir}/results_{args.sequence_mode}.json")
+    if len(test_dataset.users) == 0:
         logger.info("Chạy test riêng: python run_test_parquet.py <data_dir> <model_path>")
-    
-    if world_size > 1:
-        dist.destroy_process_group()
-
-
-def worker_fn(rank: int, args, n_gpus: int, gpu_ids: List[int]):
-    """Entry point for each GPU process (DDP)."""
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29500")
-
-    # Map rank -> real GPU id explicitly (do NOT remap with CUDA_VISIBLE_DEVICES)
-    gpu_id = int(gpu_ids[rank])
-    device = torch.device(f"cuda:{gpu_id}") if torch.cuda.is_available() else torch.device("cpu")
-    if device.type == "cuda":
-        torch.cuda.set_device(gpu_id)
-
-    # Init process group with explicit device_id when supported (PyTorch >= 2.2)
-    ipg_params = inspect.signature(dist.init_process_group).parameters
-    if "device_id" in ipg_params and device.type == "cuda":
-        dist.init_process_group(backend="nccl", rank=rank, world_size=n_gpus, device_id=gpu_id)
-    else:
-        dist.init_process_group(backend="nccl", rank=rank, world_size=n_gpus)
-
-    # Barrier with explicit device_ids when supported to avoid warning/hang
-    barrier_params = inspect.signature(dist.barrier).parameters
-    if "device_ids" in barrier_params and device.type == "cuda":
-        dist.barrier(device_ids=[gpu_id])
-    else:
-        dist.barrier()
-
-    try:
-        main_worker(args, device=device, rank=rank, world_size=n_gpus)
-    finally:
-        if n_gpus > 1 and dist.is_initialized():
-            dist.destroy_process_group()
 
 
 def main(args):
-    """Entry point. Single-GPU or multi-GPU via spawn."""
-    use_multi = getattr(args, 'multi_gpu', False)
-    gpu_ids = [int(x) for x in getattr(args, 'gpu_ids', '0').split(",")]
-    n_gpus_requested = len(gpu_ids)
-    n_gpus_available = torch.cuda.device_count() if torch.cuda.is_available() else 0
-
-    # Tránh mp.spawn khi chỉ có 1 GPU hoặc chỉ yêu cầu 1 GPU (tránh SIGABRT trên Kaggle/Colab)
-    if use_multi and n_gpus_requested > 1 and n_gpus_available >= n_gpus_requested:
-        mp.spawn(worker_fn, args=(args, n_gpus_requested, gpu_ids), nprocs=n_gpus_requested, join=True)
-    else:
-        if use_multi and n_gpus_requested > 1 and n_gpus_available < n_gpus_requested:
-            import logging
-            logging.getLogger(__name__).warning(
-                f"multi_gpu requested with {n_gpus_requested} GPUs but only {n_gpus_available} available. Running single-GPU on GPU {gpu_ids[0]}."
-            )
-        main_worker(args)
+    """Entry point (single GPU)."""
+    main_worker(args)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train TGN Sequential for Depression Detection')
-    
+
     # Sequence mode
     parser.add_argument('--sequence_mode', type=str, default='carryover',
                         choices=['carryover', 'lstm'],
@@ -591,9 +508,19 @@ if __name__ == "__main__":
                         help='Average interactions per conversation')
     parser.add_argument('--embedding_dim', type=int, default=768,
                         help='Embedding dimension')
+    parser.add_argument('--train_ratio', type=float, default=0.6,
+                        help='Tỉ lệ train (6:1:3 → 0.6). Chỉ dùng khi data_format parquet_folders hoặc csv_json.')
+    parser.add_argument('--val_ratio', type=float, default=0.1,
+                        help='Tỉ lệ validation (6:1:3 → 0.1)')
+    parser.add_argument('--test_ratio', type=float, default=0.3,
+                        help='Tỉ lệ test (6:1:3 → 0.3). Sau train sẽ tự đánh giá trên test set.')
     parser.add_argument('--split_method', type=str, default='stratified',
                         choices=['stratified', 'random'],
-                        help='Train/val/test split: stratified or random')
+                        help='Train/val/test split: stratified (giữ tỷ lệ label) hoặc random')
+    parser.add_argument('--positive_window_size', type=int, default=None,
+                        help='Slice user dương tính: số conversation mỗi sample. None/0 = không slice.')
+    parser.add_argument('--positive_overlap', type=int, default=10,
+                        help='Số conversation trùng nhau giữa 2 window khi slice (chỉ dùng khi positive_window_size set).')
     
     # TGN Model arguments
     parser.add_argument('--n_layers', type=int, default=1,
@@ -639,15 +566,9 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--gpu', type=int, default=0,
-                        help='GPU index (single-GPU mode)')
-    parser.add_argument('--multi_gpu', action='store_true',
-                        help='Train on multiple GPUs (DDP)')
-    parser.add_argument('--gpu_ids', type=str, default='0,1',
-                        help='Comma-separated GPU IDs for multi-GPU (e.g. 0,1 for 2x T4)')
+                        help='GPU index')
     parser.add_argument('--user_batch_size', type=int, default=4,
                         help='Số lượng user xử lý trước mỗi lần optimizer.step(). Tăng 8-16 nếu đủ VRAM để train nhanh hơn.')
-    parser.add_argument('--use_batch_forward', action='store_true', default=True,
-                        help='LSTM mode: train luôn dùng gradient accumulation (từng user forward/backward) để tránh OOM; user_batch_size vẫn là số user mỗi optimizer.step().')
     parser.add_argument('--eval_batch_size', type=int, default=8,
                         help='Số user gom một lần khi evaluate (LSTM mode). Tăng để val nhanh hơn.')
     parser.add_argument('--use_carryover_grad', action='store_true', default=True,
