@@ -132,6 +132,15 @@ class SequenceMemoryUpdater(MemoryUpdater):
         new_memory = self.memory_updater(unique_messages, current_memory)
         return new_memory, timestamps
 
+    def get_updated_memory_rows_only(
+        self,
+        unique_node_ids: List[int],
+        unique_messages: torch.Tensor,
+        timestamps: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Chỉ trả về memory đã update cho các node (không clone full buffer) — tránh OOM."""
+        return self.get_updated_memory(unique_node_ids, unique_messages, timestamps)
+
 
 class GRUMemoryUpdater(SequenceMemoryUpdater):
     """
