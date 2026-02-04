@@ -289,38 +289,61 @@ def main_worker(args, device: Optional[torch.device] = None):
             max_ego_hops=None if getattr(args, "max_ego_hops", 2) < 0 else getattr(args, "max_ego_hops", 2),
             verbose=True,
         )
-    else:
-        train_dataset, val_dataset, test_dataset, metadata = load_depression_data(
-            interactions_path=f"{args.data_dir}/interactions.csv",
-            embeddings_path=f"{args.data_dir}/embeddings.json",
-            labels_path=f"{args.data_dir}/labels.json",
-            val_ratio=args.val_ratio,
-            test_ratio=args.test_ratio,
-            split_method=args.split_method,
-            seed=args.seed
-        )
+    # else:
+    #     train_dataset, val_dataset, test_dataset, metadata = load_depression_data(
+    #         interactions_path=f"{args.data_dir}/interactions.csv",
+    #         embeddings_path=f"{args.data_dir}/embeddings.json",
+    #         labels_path=f"{args.data_dir}/labels.json",
+    #         val_ratio=args.val_ratio,
+    #         test_ratio=args.test_ratio,
+    #         split_method=args.split_method,
+    #         seed=args.seed
+    #     )
     
-    logger.info("Training dataset:")
-    train_dataset.print_statistics(verbose=True)
+    def _one_line_stats(ds: DepressionDataset) -> str:
+        n = len(ds.users)
+        if n == 0:
+            return "0 users"
+        n_pos = sum(1 for u in ds.users if u.label == 1)
+        return f"{n} users ({n_pos} pos, {n - n_pos} neg)"
+
+    def _drop_empty_conversations(ds: DepressionDataset) -> int:
+        """Bỏ các conversation không có event nào (n_interactions==0), không đưa vào model. Trả về số conv đã bỏ."""
+        dropped = 0
+        for u in ds.users:
+            before = len(u.conversations)
+            u.conversations = [c for c in u.conversations if c.n_interactions > 0]
+            dropped += before - len(u.conversations)
+        return dropped
+
+    logger.info("Training dataset: %s", _one_line_stats(train_dataset))
+
+    # Chỉ drop empty conversations ở train/val; giữ nguyên tập test (chạy test đúng như run_test_parquet)
+    total_dropped = _drop_empty_conversations(train_dataset) + _drop_empty_conversations(val_dataset)
+    if total_dropped > 0:
+        logger.info("Dropped %d empty conversations (no events) in train/val.", total_dropped)
 
     def _filter_nonempty(ds: DepressionDataset) -> DepressionDataset:
+        before = len(ds.users)
         ds.users = [u for u in ds.users if u.total_interactions > 0]
+        removed = before - len(ds.users)
+        if removed > 0:
+            logger.info("Filtered out %d empty users (no interactions); %d remaining.", removed, len(ds.users))
         return ds
 
     train_dataset = _filter_nonempty(train_dataset)
     val_dataset = _filter_nonempty(val_dataset)
-    test_dataset = _filter_nonempty(test_dataset)
+    # Không filter test: tập test giữ nguyên để đánh giá đúng như run_test_parquet (có thể có user/conv rỗng, script test đã xử lý skip trong run)
 
-    logger.info("Training dataset (after filtering empty users):")
-    train_dataset.print_statistics(verbose=True)
-
-    # Slice positive users theo window_size / overlap (chỉ train)
+    # Slice positive users theo window_size / overlap (chỉ train): mỗi user dương tính thành nhiều sample (sliding window) → số sample tăng, tỷ lệ pos tăng
     if getattr(args, 'positive_window_size', None) and args.positive_window_size >= 1:
         overlap = getattr(args, 'positive_overlap', 0) or 0
-        logger.info(f"Slicing positive users: window_size={args.positive_window_size}, overlap={overlap}")
+        logger.info("Slicing positive users: window_size=%s, overlap=%s", args.positive_window_size, overlap)
         train_dataset = slice_positive_users(train_dataset, args.positive_window_size, overlap)
-        logger.info("Training dataset (after slicing positive users):")
-        train_dataset.print_statistics(verbose=True)
+        logger.info("After slicing: %s (mỗi user dương tính → nhiều window-samples)", _one_line_stats(train_dataset))
+
+    logger.info("Final training set:")
+    train_dataset.print_statistics(verbose=True)
 
     train_pos = np.mean([u.label for u in train_dataset.users])
     val_pos = np.mean([u.label for u in val_dataset.users])
@@ -431,22 +454,29 @@ def main_worker(args, device: Optional[torch.device] = None):
         logger.info("No best model saved (val AUC did not improve); saved last model.")
     logger.info(f"\nBest model saved: {best_path} (epoch {best_epoch}, val AUC: {best_val_auc:.4f})")
 
-    # Đánh giá trên test set (pipeline train + test)
+    # Đánh giá test chuẩn eRisk (build_temporal_run + METRICS: ERDE, latency, ...)
     test_metrics = None
     if len(test_dataset.users) > 0:
-        logger.info("Evaluating on test set...")
+        logger.info("Evaluating on test set (eRisk standard)...")
         save_model = model.module if hasattr(model, 'module') else model
         save_model.load_state_dict(torch.load(best_path, map_location=device))
-        test_loss, test_metrics, _, _ = evaluate(
-            model=model,
-            dataset=test_dataset,
-            device=device,
-            n_neighbors=args.n_neighbors,
-            eval_batch_size=getattr(args, "eval_batch_size", 8),
-        )
-        logger.info(f"Test Loss: {test_loss:.4f}, Test Metrics: {test_metrics}")
-    else:
-        logger.info("No test set (test_ratio=0); skip test evaluation.")
+        try:
+            from run_test_parquet import build_temporal_run
+            from utils.metrics import METRICS
+            threshold = getattr(args, "threshold", 0.5)
+            temporal_run, golden = build_temporal_run(
+                model=model,
+                dataset=test_dataset,
+                device=device,
+                n_neighbors=args.n_neighbors,
+                threshold=threshold,
+            )
+            test_metrics = {}
+            for name, (metric_fn, _) in METRICS.items():
+                test_metrics[name] = float(metric_fn(temporal_run, golden))
+            logger.info("Test (eRisk): %s", test_metrics)
+        except Exception as e:
+            logger.warning("Test eRisk metrics skipped: %s", e)
 
     results = {
         'sequence_mode': args.sequence_mode,
@@ -583,6 +613,8 @@ if __name__ == "__main__":
                         help='Directory to save models')
     parser.add_argument('--log_dir', type=str, default='./logs',
                         help='Directory for logs')
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help='Ngưỡng quyết định khi đánh giá test (p>=threshold => positive), dùng cho temporal metrics như run_test_parquet')
     
     args = parser.parse_args()
     main(args)
