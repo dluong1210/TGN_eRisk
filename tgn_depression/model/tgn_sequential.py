@@ -128,13 +128,14 @@ class TGNSequential(nn.Module):
                  memory_dimension: int = 172,
                  message_dimension: int = 100,
                  embedding_module_type: str = "graph_attention",
-                     message_function_type: str = "identity",
-                     aggregator_type: str = "last",
-                     memory_updater_type: str = "gru",
-                     n_neighbors: int = 10,
-                     num_classes: int = 2,
-                     conversation_batch_size: int = 200,
-                     max_conversations_per_user: Optional[int] = 80):
+                 message_function_type: str = "identity",
+                 aggregator_type: str = "last",
+                 memory_updater_type: str = "gru",
+                 n_neighbors: int = 10,
+                 num_classes: int = 2,
+                 conversation_batch_size: int = 200,
+                 max_conversations_per_user: Optional[int] = 80,
+                 use_carryover_grad: bool = True):
         """
         Args:
             sequence_mode: 'carryover' hoặc 'lstm'
@@ -155,8 +156,8 @@ class TGNSequential(nn.Module):
         self.sequence_mode = sequence_mode
         self.logger = logging.getLogger(__name__)
         self.conversation_batch_size = conversation_batch_size
-        # Giới hạn số conversation mỗi user để tránh OOM khi user có 100+ conv (chỉ lấy K conv gần nhất)
         self.max_conversations_per_user = max_conversations_per_user
+        self.use_carryover_grad = use_carryover_grad
         
         assert sequence_mode in ['carryover', 'lstm'], \
             f"sequence_mode must be 'carryover' or 'lstm', got {sequence_mode}"
@@ -424,16 +425,22 @@ class TGNSequential(nn.Module):
             batch_timestamps = timestamps_use[start_idx:end_idx]
             batch_post_ids = edge_idxs_use[start_idx:end_idx]
             if self.use_memory:
-                positives = np.concatenate([batch_sources, batch_dests])
-                unique_positives = np.unique(positives)
-                self.update_memory(unique_positives.tolist(), self.memory.messages)
-                self.memory.clear_messages(unique_positives.tolist())
+                # Apply messages from PREVIOUS batch to memory, then clear (nodes that HAVE messages)
+                nodes_with_messages = list(self.memory.messages.keys())
+                if nodes_with_messages:
+                    self.update_memory(nodes_with_messages, self.memory.messages)
+                    self.memory.clear_messages(nodes_with_messages)
                 unique_sources, source_msgs, unique_dests, dest_msgs = self.get_raw_messages(
                     batch_sources, batch_dests, batch_timestamps, batch_post_ids
                 )
                 self.memory.store_raw_messages(unique_sources, source_msgs)
                 self.memory.store_raw_messages(unique_dests, dest_msgs)
         
+        # Apply last batch to memory so compute_user_embedding sees consistent state
+        if self.use_memory and self.memory.messages:
+            nodes_with_messages = list(self.memory.messages.keys())
+            self.update_memory(nodes_with_messages, self.memory.messages)
+            self.memory.clear_messages(nodes_with_messages)
         return end_time
     
     def process_conversations_batch(self,
@@ -541,18 +548,20 @@ class TGNSequential(nn.Module):
                 batch_post_ids = edge_idxs_use[start_idx:end_idx]
                 
                 if self.use_memory:
-                    positives = np.concatenate([batch_sources, batch_dests])
-                    unique_positives = np.unique(positives)
-                    self.update_memory(unique_positives.tolist(), self.memory.messages)
-                    self.memory.clear_messages(unique_positives.tolist())
-                    
+                    nodes_with_messages = list(self.memory.messages.keys())
+                    if nodes_with_messages:
+                        self.update_memory(nodes_with_messages, self.memory.messages)
+                        self.memory.clear_messages(nodes_with_messages)
                     unique_sources, source_msgs, unique_dests, dest_msgs = self.get_raw_messages(
                         batch_sources, batch_dests, batch_timestamps, batch_post_ids
                     )
-                    
                     self.memory.store_raw_messages(unique_sources, source_msgs)
                     self.memory.store_raw_messages(unique_dests, dest_msgs)
             
+            if self.use_memory and self.memory.messages:
+                nodes_with_messages = list(self.memory.messages.keys())
+                self.update_memory(nodes_with_messages, self.memory.messages)
+                self.memory.clear_messages(nodes_with_messages)
             # Lấy embedding tại end_time của conversation này
             user_embedding = self.compute_user_embedding(
                 target_user, end_time, n_neighbors
@@ -636,7 +645,11 @@ class TGNSequential(nn.Module):
             )
             
             # ===== CARRY-OVER: Chỉ lưu node features cho target user =====
-            self._node_features_custom[target_user] = user_embedding.squeeze(0).detach()
+            # use_carryover_grad=True: gradient chảy qua toàn chuỗi (model học được). False: chỉ học từ conv cuối (tiết kiệm VRAM).
+            emb_to_store = user_embedding.squeeze(0)
+            if not self.use_carryover_grad:
+                emb_to_store = emb_to_store.detach()
+            self._node_features_custom[target_user] = emb_to_store
             
             last_embedding = user_embedding  # Giữ để classify từ tensor có grad
             
@@ -897,10 +910,10 @@ class TGNSequential(nn.Module):
             batch_post_ids = post_ids[event_idx:j]
             
             if self.use_memory and len(batch_sources) > 0:
-                positives = np.concatenate([batch_sources, batch_dests])
-                unique_positives = np.unique(positives)
-                self.update_memory(unique_positives.tolist(), self.memory.messages)
-                self.memory.clear_messages(unique_positives.tolist())
+                nodes_with_messages = list(self.memory.messages.keys())
+                if nodes_with_messages:
+                    self.update_memory(nodes_with_messages, self.memory.messages)
+                    self.memory.clear_messages(nodes_with_messages)
                 unique_sources, source_msgs, unique_dests, dest_msgs = self.get_raw_messages(
                     batch_sources, batch_dests, batch_timestamps, batch_post_ids
                 )

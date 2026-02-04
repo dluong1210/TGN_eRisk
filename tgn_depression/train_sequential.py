@@ -38,7 +38,7 @@ from utils.data_loader import (
     load_depression_data_from_parquet_folders,
     create_dummy_data,
 )
-from utils.utils import EarlyStopMonitor, set_seed, get_device, get_device_for_rank, compute_class_weights
+from utils.utils import EarlyStopMonitor, set_seed, get_device, compute_class_weights
 
 
 class IndexDataset(Dataset):
@@ -288,6 +288,9 @@ def main_worker(args,
     if rank == 0:
         logger.info("Training dataset (after filtering empty users):")
         train_dataset.print_statistics(verbose=True)
+        train_pos = np.mean([u.label for u in train_dataset.users])
+        val_pos = np.mean([u.label for u in val_dataset.users])
+        logger.info(f"Train pos ratio: {train_pos:.4f}, Val pos ratio: {val_pos:.4f} (baseline predict-all-1 F1≈{2*val_pos/(1+val_pos):.4f})")
     
     # Compute class weights
     train_labels = np.array([u.label for u in train_dataset.users])
@@ -320,6 +323,7 @@ def main_worker(args,
         num_classes=2,
         conversation_batch_size=getattr(args, "conversation_batch_size", 500),
         max_conversations_per_user=None if getattr(args, "max_conversations_per_user", 80) == -1 else getattr(args, "max_conversations_per_user", 80),
+        use_carryover_grad=getattr(args, "use_carryover_grad", True),
     ).to(device)
     
     if world_size > 1:
@@ -371,7 +375,7 @@ def main_worker(args,
     
     if rank == 0:
         logger.info("Starting training...")
-    best_val_f1 = 0.0
+    best_val_auc = 0.0
     best_epoch = 0
     
     for epoch in range(args.epochs):
@@ -418,7 +422,7 @@ def main_worker(args,
             max_size = max(s.item() for s in size_list)
             if max_size == 0:
                 val_metrics = {}
-                val_f1 = 0.0
+                val_auc = 0.0
             else:
                 if preds_t.shape[0] == 0:
                     preds_t = torch.zeros(max_size, dtype=torch.float32).to(device)
@@ -443,12 +447,12 @@ def main_worker(args,
                         }
                         pr, rc, _, _ = precision_recall_fscore_support(all_labels, (all_preds > 0.5).astype(int), average='binary', zero_division=0)
                         val_metrics['precision'], val_metrics['recall'] = pr, rc
-                val_f1_local = val_metrics.get('f1', 0.0)
-                val_f1_t = torch.tensor([val_f1_local], dtype=torch.float32).to(device)
-                dist.broadcast(val_f1_t, src=0)
-                val_f1 = val_f1_t.item()
+                val_auc_local = val_metrics.get('auc', 0.0)
+                val_auc_t = torch.tensor([val_auc_local], dtype=torch.float32).to(device)
+                dist.broadcast(val_auc_t, src=0)
+                val_auc = val_auc_t.item()
         else:
-            val_f1 = val_metrics.get('f1', 0.0)
+            val_auc = val_metrics.get('auc', 0.0)
         
         epoch_time = time.time() - epoch_start
         
@@ -457,17 +461,17 @@ def main_worker(args,
             logger.info(f"  Train Loss: {train_loss:.4f}, Metrics: {train_metrics}")
             logger.info(f"  Val Loss: {val_loss:.4f}, Metrics: {val_metrics}")
         
-        scheduler.step(val_f1)
+        scheduler.step(val_auc)
         
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
             best_epoch = epoch + 1
             if rank == 0:
                 save_model = model.module if hasattr(model, 'module') else model
                 torch.save(save_model.state_dict(), f"{args.save_dir}/best_model_{args.sequence_mode}.pth")
-                logger.info(f"  New best model saved! (F1: {val_f1:.4f})")
+                logger.info(f"  New best model saved! (AUC: {val_auc:.4f})")
         
-        if early_stopper.early_stop_check(val_f1):
+        if early_stopper.early_stop_check(val_auc):
             if rank == 0:
                 logger.info(f"Early stopping triggered after {epoch + 1} epochs")
             break
@@ -478,13 +482,13 @@ def main_worker(args,
             save_model = model.module if hasattr(model, 'module') else model
             torch.save(save_model.state_dict(), best_path)
             logger.info("No best model saved (val F1 did not improve); saved last model.")
-        logger.info(f"\nBest model saved: {best_path} (epoch {best_epoch}, val F1: {best_val_f1:.4f})")
+        logger.info(f"\nBest model saved: {best_path} (epoch {best_epoch}, val AUC: {best_val_auc:.4f})")
         
         import json
         results = {
             'sequence_mode': args.sequence_mode,
             'best_epoch': best_epoch,
-            'best_val_f1': best_val_f1,
+            'best_val_auc': best_val_auc,
             'args': vars(args)
         }
         with open(f"{args.save_dir}/results_{args.sequence_mode}.json", 'w') as f:
@@ -646,6 +650,10 @@ if __name__ == "__main__":
                         help='LSTM mode: train luôn dùng gradient accumulation (từng user forward/backward) để tránh OOM; user_batch_size vẫn là số user mỗi optimizer.step().')
     parser.add_argument('--eval_batch_size', type=int, default=8,
                         help='Số user gom một lần khi evaluate (LSTM mode). Tăng để val nhanh hơn.')
+    parser.add_argument('--use_carryover_grad', action='store_true', default=True,
+                        help='Carryover: bật gradient qua toàn chuỗi (default). --no_use_carryover_grad để tắt (tiết kiệm VRAM).')
+    parser.add_argument('--no_use_carryover_grad', action='store_false', dest='use_carryover_grad',
+                        help='Carryover: tắt gradient qua chuỗi, chỉ học từ conversation cuối.')
     parser.add_argument('--max_ego_hops', type=int, default=2,
                         help='Khi load parquet: chỉ giữ event trong L-hop ego (0/1/2). -1 = tắt (load full).')
     
