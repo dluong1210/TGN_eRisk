@@ -29,6 +29,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 from model.tgn_sequential import TGNSequential
 from utils.data_loader import load_depression_data_from_parquet_folders
 from utils.utils import set_seed, get_device
+from utils.metrics import METRICS, Run
 from train_sequential import evaluate, setup_logging
 
 
@@ -53,7 +54,130 @@ def parse_args():
                         help="Đường dẫn file results JSON (mặc định: cùng thư mục với model, results_<mode>.json)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Ngưỡng quyết định (p>=threshold => phát hiện depression) cho metrics eRisk",
+    )
     return parser.parse_args()
+
+
+def build_temporal_run(
+    model: TGNSequential,
+    dataset,
+    device: torch.device,
+    n_neighbors: int,
+    threshold: float = 0.5,
+) -> tuple[Run, dict]:
+    """
+    Chạy predict theo từng conversation cho từng user và xây dựng cấu trúc Run
+    để tính các metrics trong utils.metrics (ERDE, latency, speed, ...).
+
+    Với LSTM mode:
+      - Sau mỗi conversation i, thu được embedding của target user.
+      - Chuỗi embeddings [1..i] được feed qua LSTM, lấy output tại state i
+        (ở đây dùng lstm_out tại mỗi timestep, rồi classification head trên
+        toàn bộ sequence một lần) → p_i.
+      - Quyết định tại conversation i: decision_i = (p_i >= threshold).
+
+    Run[subject] = [(time_str, conv_id_str, decision_bool, score_float), ...]
+    """
+    base_model = model
+    base_model.eval()
+
+    run: Run = {}
+    golden: dict[str, bool] = {}
+
+    with torch.inference_mode():
+        for user_data in dataset.users:
+            subject_id = user_data.user_id_str
+            golden[subject_id] = bool(user_data.label)
+
+            # Nếu không có conversation hoặc không có interaction, không ra quyết định thời gian.
+            conversations = user_data.get_conversations_sorted()
+            if (
+                len(conversations) == 0
+                or user_data.total_interactions == 0
+            ):
+                run[subject_id] = []
+                continue
+
+            # Giới hạn số conversation giống forward_lstm để tránh OOM.
+            max_convs = getattr(base_model, "max_conversations_per_user", None)
+            if max_convs is not None and len(conversations) > max_convs:
+                conversations = conversations[-max_convs:]
+
+            # Hiện tại chỉ hỗ trợ LSTM mode cho metrics theo thời gian.
+            if getattr(base_model, "sequence_mode", "carryover") != "lstm":
+                # Fallback: một quyết định duy nhất tại cuối chuỗi.
+                base_model.reset_state()
+                logits = base_model.forward_user(user_data, n_neighbors)
+                prob = torch.softmax(logits, dim=1)[0, 1].item()
+                decision = prob >= threshold
+                last_conv = conversations[-1]
+                run[subject_id] = [
+                    (str(last_conv.end_time), str(last_conv.conversation_id), bool(decision), float(prob))
+                ]
+                continue
+
+            # ========== LSTM mode: tính embedding sau từng conversation ==========
+            base_model.reset_state()
+            target_user = user_data.user_id
+            conversation_embeddings = []
+            used_convs = []
+
+            for conv in conversations:
+                if conv.n_interactions == 0:
+                    continue
+
+                # Reset memory trước mỗi conversation để đảm bảo độc lập,
+                # giống như forward_lstm (nhánh tuần tự).
+                if base_model.use_memory:
+                    base_model.memory.__init_memory__()
+
+                # Process conversation (build neighbor_finder + memory update).
+                end_time = base_model.process_conversation(
+                    conv, n_neighbors, target_user=target_user
+                )
+
+                # Lấy embedding của target user tại thời điểm end_time.
+                user_emb = base_model.compute_user_embedding(
+                    target_user, end_time, n_neighbors
+                )
+                conversation_embeddings.append(user_emb)
+                used_convs.append(conv)
+
+            if len(conversation_embeddings) == 0:
+                run[subject_id] = []
+                continue
+
+            # Chuỗi embeddings: [1, n_convs, emb_dim]
+            emb_seq = torch.cat(conversation_embeddings, dim=0).unsqueeze(0)
+
+            # Forward LSTM → lstm_out (hidden cho từng timestep).
+            lstm_out, _ = base_model.lstm(emb_seq)  # lstm_out: [1, seq_len, hidden_dim*dirs]
+
+            # Classification head trên từng timestep:
+            #   - reshape về [seq_len, hidden_dim*dirs]
+            #   - classifier xử lý cả batch → logits_seq [seq_len, num_classes]
+            logits_seq = base_model.classifier(lstm_out.squeeze(0))
+            probs = torch.softmax(logits_seq, dim=1)[:, 1].cpu().numpy()
+
+            decisions = probs >= threshold
+            subject_predictions = []
+
+            for i, (conv, dec, p) in enumerate(zip(used_convs, decisions, probs)):
+                # time_str dùng end_time; conv_id_str là conversation_id gốc.
+                time_str = str(conv.end_time)
+                conv_id_str = str(conv.conversation_id)
+                subject_predictions.append(
+                    (time_str, conv_id_str, bool(dec), float(p))
+                )
+
+            run[subject_id] = subject_predictions
+
+    return run, golden
 
 
 def main():
@@ -150,10 +274,31 @@ def main():
 
     logger.info("=" * 50)
     logger.info("Kết quả đánh giá (Evaluation / Test)")
-    logger.info(f"  Loss:    {loss:.4f}")
-    logger.info(f"  Metrics: {metrics}")
-    logger.info("=" * 50)
-    print("\nEvaluation metrics:", metrics)
+    logger.info(f"  Loss (per-user):    {loss:.4f}")
+    logger.info(f"  Metrics (per-user): {metrics}")
+
+    # ========== Extra: metrics kiểu eRisk dựa trên quyết định theo từng conversation ==========
+    try:
+        temporal_run, golden = build_temporal_run(
+            model=model,
+            dataset=eval_dataset,
+            device=device,
+            n_neighbors=n_neighbors,
+            threshold=args.threshold,
+        )
+
+        temporal_metrics: dict[str, float] = {}
+        for name, (metric_fn, _lower_is_better) in METRICS.items():
+            temporal_metrics[name] = float(metric_fn(temporal_run, golden))
+
+        logger.info("Metrics theo từng conversation (eRisk style):")
+        for k, v in temporal_metrics.items():
+            logger.info(f"  {k}: {v:.4f}")
+        print("\nEvaluation metrics (per-user):", metrics)
+        print("Temporal metrics (per-conversation / eRisk):", temporal_metrics)
+    except Exception as e:  # pragma: no cover - chỉ log, không dừng chương trình
+        logger.exception(f"Lỗi khi tính temporal metrics (ERDE/latency): {e}")
+        print("\nEvaluation metrics (per-user):", metrics)
 
 
 if __name__ == "__main__":

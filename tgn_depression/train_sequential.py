@@ -338,7 +338,7 @@ def main_worker(args,
     if rank == 0:
         logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.5, patience=3
