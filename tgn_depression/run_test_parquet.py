@@ -266,7 +266,7 @@ def main():
         logger.warning(f"Keys thừa trong file (bỏ qua): {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
 
     n_neighbors = getattr(nargs, "n_neighbors", 10)
-    loss, metrics = evaluate(
+    loss, metrics, _, _ = evaluate(
         model=model,
         dataset=eval_dataset,
         device=device,
