@@ -385,6 +385,7 @@ def load_depression_data_from_parquet_folders(
     seed: int = 42,
     max_ego_hops: Optional[int] = 2,
     verbose: bool = True,
+    drop_none_embeddings: bool = False,
 ) -> Tuple[DepressionDataset, DepressionDataset, DepressionDataset, Dict]:
     """
     Load data từ 2 folder neg (label 0) và pos (label 1).
@@ -456,10 +457,22 @@ def load_depression_data_from_parquet_folders(
         for conv_id, group in conv_groups:
             group = group.sort_values("timestamp").reset_index(drop=True)
             # (uid, pid, ts, post_id, embedding) để sau khi lọc ego vẫn có embedding
-            rows_raw = [
-                (str(row["userID"]), str(row["parentID"]), float(row["timestamp"]), str(row["post_id"]), _embedding_to_1d(row["embedding"]))
-                for _, row in group.iterrows()
-            ]
+            rows_raw = []
+            for _, row in group.iterrows():
+                emb = _embedding_to_1d(row["embedding"])
+                # Khi test có thể có embedding=None → emb rỗng.
+                # Nếu drop_none_embeddings=True thì bỏ hoàn toàn những event này.
+                if drop_none_embeddings and emb.size == 0:
+                    continue
+                rows_raw.append(
+                    (
+                        str(row["userID"]),
+                        str(row["parentID"]),
+                        float(row["timestamp"]),
+                        str(row["post_id"]),
+                        emb,
+                    )
+                )
             if max_ego_hops is not None:
                 ego = _ego_nodes_from_conv_rows(
                     [(r[0], r[1], r[2]) for r in rows_raw],
@@ -505,12 +518,16 @@ def load_depression_data_from_parquet_folders(
     for target_user_id_str, label, file_rows in pending_per_file:
         user_idx = user_to_idx[target_user_id_str]
         if len(file_rows) == 0:
-            all_user_data.append(UserData(
-                user_id=user_idx,
-                user_id_str=target_user_id_str,
-                conversations=[],
-                label=label
-            ))
+            # Không còn event nào cho user này (vd. tất cả embedding=None và bị drop).
+            # VẪN giữ nguyên label gốc từ data; chỉ là không có conversation nào.
+            all_user_data.append(
+                UserData(
+                    user_id=user_idx,
+                    user_id_str=target_user_id_str,
+                    conversations=[],
+                    label=label,
+                )
+            )
             continue
         
         # Group by conversation_id, giữ thứ tự xuất hiện trong file
@@ -555,7 +572,7 @@ def load_depression_data_from_parquet_folders(
             user_id=user_idx,
             user_id_str=target_user_id_str,
             conversations=conversations_list,
-            label=label
+            label=label,
         )
         all_user_data.append(user_data)
     

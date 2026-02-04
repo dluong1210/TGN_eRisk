@@ -228,6 +228,7 @@ def main():
         test_ratio=0.0,
         split_method="stratified",
         seed=args.seed,
+        drop_none_embeddings=True,
     )
     # train_dataset ở đây chứa toàn bộ mẫu (dùng làm tập test)
     eval_dataset = train_dataset
