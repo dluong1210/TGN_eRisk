@@ -39,13 +39,15 @@ except ImportError:
 
 class _MemoryView:
     """
-    View chỉ các node đã update (ego). Index bằng node_id → trả về hàng tương ứng hoặc 0.
-    Không cần full buffer (n_users, dim).
+    View merge: ưu tiên hàng vừa update (updated_rows), node không có thì lấy base_memory.
+    Index bằng node_id → đúng với model (embedding cần memory cho mọi node trong ego).
     """
-    def __init__(self, device: torch.device, dim: int, updated_rows: Dict[int, torch.Tensor]):
+    def __init__(self, device: torch.device, dim: int, updated_rows: Dict[int, torch.Tensor],
+                 base_memory: Optional[Memory] = None):
         self._device = device
         self._dim = dim
         self.updated = updated_rows
+        self._base = base_memory
 
     def __getitem__(self, key):
         if isinstance(key, tuple) and len(key) == 2:
@@ -61,6 +63,8 @@ class _MemoryView:
             nid = int(indices[i])
             if nid in self.updated:
                 out[i] = self.updated[nid]
+            elif self._base is not None:
+                out[i] = self._base.get_memory([nid])[0]
         if slice_obj != slice(None):
             return out[slice_obj]
         return out
@@ -340,7 +344,7 @@ class TGNSequential(nn.Module):
             self.message_aggregator.aggregate(nodes, messages)
         
         if len(unique_nodes) == 0:
-            return _MemoryView(self.device, self.memory.memory_dimension, {}), None
+            return _MemoryView(self.device, self.memory.memory_dimension, {}, self.memory), None
         unique_messages = self.message_function.compute_message(unique_messages)
         updated_rows, _ = self.memory_updater.get_updated_memory_rows_only(
             unique_nodes, unique_messages, timestamps=unique_timestamps
@@ -348,7 +352,7 @@ class TGNSequential(nn.Module):
         if updated_rows.dtype != torch.float32:
             updated_rows = updated_rows.to(torch.float32)
         updated_dict = {int(nid): updated_rows[i] for i, nid in enumerate(unique_nodes)}
-        return _MemoryView(self.device, self.memory.memory_dimension, updated_dict), None
+        return _MemoryView(self.device, self.memory.memory_dimension, updated_dict, self.memory), None
     
     def update_memory(self, nodes: List[int], messages: Dict):
         """Update memory in-place."""
