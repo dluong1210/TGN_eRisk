@@ -172,7 +172,9 @@ class TGNSequential(nn.Module):
             self.n_node_features = memory_dimension
         else:
             self.memory_dimension = 0
-            self.n_node_features = self.n_edge_features
+            # Khi không dùng memory vẫn dùng memory_dimension cho n_node_features để tránh OOM.
+            # Trước đây dùng n_edge_features (384/768) → tensor và LSTM rất lớn → dễ OOM.
+            self.n_node_features = memory_dimension
         
         # Node features — chỉ lưu cho node đã set (target_user trong carryover), còn lại = 0
         self._node_features_custom: Dict[int, torch.Tensor] = {}
