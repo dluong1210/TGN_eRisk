@@ -831,6 +831,15 @@ class TGNSequential(nn.Module):
         Forward pass trên MỘT graph lớn gộp từ nhiều users: gộp mọi conversation trong batch
         thành một timeline events, chạy TGN một lần, snapshot embedding tại mỗi conversation end.
         Nhanh hơn rất nhiều so với chạy TGN từng conversation / từng user.
+
+        LOGIC SO VỚI TỪNG USER:
+        - Memory của mỗi node chỉ được cập nhật bởi các event mà node đó tham gia (source/dest).
+        - Khi snapshot target A tại end_time, embedding chỉ dùng A và neighbors của A (neighbor_finder
+          chỉ có edge liên quan A từ chính các conv của A). Nếu các user trong conversation của từng
+          target là KHÁC NHAU giữa các target (không có node xuất hiện trong conv của cả A và X),
+          thì mỗi node chỉ được cập nhật bởi đúng một target → logic merged TƯƠNG ĐƯƠNG từng user.
+        - Chỉ khi có node chung (ví dụ user B xuất hiện trong cả conv của target A và target X) thì
+          memory[B] mới bị "trộn" từ hai bên; lúc đó merged mới khác semantics.
         
         Hỗ trợ cả carryover và lstm mode.
         
@@ -854,7 +863,7 @@ class TGNSequential(nn.Module):
             return torch.zeros(0, 2).to(self.device)
         
         sources, destinations, timestamps, post_ids, conv_ends, user_ids, _ = \
-            merge_user_data_to_graph(batch_user_data)
+            merge_user_data_to_graph(batch_user_data, self.max_conversations_per_user)
         
         if len(sources) == 0:
             zero_emb = torch.zeros(1, self.n_node_features).to(self.device)

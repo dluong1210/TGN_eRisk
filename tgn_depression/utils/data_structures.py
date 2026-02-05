@@ -192,6 +192,63 @@ class DepressionDataset:
         print("=" * 50)
 
 
+def merge_user_data_to_graph(
+    batch_user_data: List[UserData],
+    max_conversations_per_user: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Tuple[float, int, int]], List[int], None]:
+    """
+    Gộp nhiều UserData thành một timeline events (một graph) để forward_merged_graph
+    chạy TGN một lần thay vì từng user/conversation.
+
+    Returns:
+        sources, destinations, timestamps, post_ids: events đã sort theo thời gian
+        conv_ends: list (end_time, user_idx_in_batch, conv_idx) đã sort theo end_time
+        user_ids: user_id (node id) cho từng user trong batch
+        _: placeholder (None)
+    """
+    events: List[Tuple[float, int, int, int, int, int]] = []  # ts, user_i, conv_j, src, dst, post_id
+    conv_ends: List[Tuple[float, int, int]] = []  # end_time, user_idx, conv_idx
+    user_ids: List[int] = []
+
+    for user_idx, user_data in enumerate(batch_user_data):
+        user_ids.append(user_data.user_id)
+        convs = user_data.get_conversations_sorted()
+        if max_conversations_per_user is not None and len(convs) > max_conversations_per_user:
+            convs = convs[-max_conversations_per_user:]
+        for conv_idx, conv in enumerate(convs):
+            if conv.n_interactions == 0:
+                continue
+            for k in range(conv.n_interactions):
+                events.append((
+                    float(conv.timestamps[k]),
+                    user_idx,
+                    conv_idx,
+                    int(conv.source_users[k]),
+                    int(conv.dest_users[k]),
+                    int(conv.post_ids[k]),
+                ))
+            conv_ends.append((float(conv.end_time), user_idx, conv_idx))
+
+    if not events:
+        return (
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.float64),
+            np.array([], dtype=np.int64),
+            [],
+            user_ids,
+            None,
+        )
+
+    events.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
+    sources = np.array([e[3] for e in events], dtype=np.int64)
+    destinations = np.array([e[4] for e in events], dtype=np.int64)
+    timestamps = np.array([e[0] for e in events], dtype=np.float64)
+    post_ids = np.array([e[5] for e in events], dtype=np.int64)
+    conv_ends.sort(key=lambda x: (x[0], x[1], x[2]))
+    return sources, destinations, timestamps, post_ids, conv_ends, user_ids, None
+
+
 def collate_users(batch: List[UserData]) -> UserBatch:
     """
     Collate function for DataLoader.

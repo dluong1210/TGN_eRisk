@@ -117,54 +117,70 @@ def train_epoch(model: TGNSequential,
                 criterion: nn.Module,
                 device: torch.device,
                 n_neighbors: int = 10,
-                user_batch_size: int = 1) -> Tuple[float, Dict]:
-    """Train for one epoch."""
+                user_batch_size: int = 1,
+                use_batch_forward: bool = False) -> Tuple[float, Dict]:
+    """Train for one epoch. use_batch_forward=True (LSTM only): 1 forward cho cả batch user (merged graph), nhanh hơn nhiều."""
     model.train()
     base_model = model.module if hasattr(model, 'module') else model
     total_loss = 0
     all_preds = []
     all_labels = []
     n_users_processed = 0
+    use_merged = use_batch_forward and getattr(base_model, 'sequence_mode', None) == 'lstm'
 
     indices = list(range(len(dataset.users)))
-    
-    # Batching theo user: gom nhiều user trước khi update optimizer
     user_batch_size = max(1, int(user_batch_size))
-    
+
     for batch_start in range(0, len(indices), user_batch_size):
         batch_indices = indices[batch_start:batch_start + user_batch_size]
         if len(batch_indices) == 0:
             continue
-        
+
         optimizer.zero_grad()
         n_in_batch = len(batch_indices)
-        batch_probs = []
-        batch_labels_list = []
-        # Luôn dùng gradient accumulation (từng user forward/backward) để tránh OOM.
-        # forward_batch_users gom N user giữ N computation graph → VRAM xN. Accumulation chỉ giữ 1 graph.
-        for user_idx in batch_indices:
-            user_data = dataset.users[user_idx]
-            base_model.reset_state()
-            logits = model(user_data, n_neighbors)
-            batch_labels_list.append(user_data.label)
-            loss = criterion(logits, torch.tensor([user_data.label], dtype=torch.long, device=device))
-            (loss / n_in_batch).backward()
-            base_model.detach_memory()
+        batch_users = [dataset.users[i] for i in batch_indices]
+        batch_labels = np.array([u.label for u in batch_users], dtype=np.int64)
+        labels_t = torch.tensor(batch_labels, dtype=torch.long, device=device)
+
+        if use_merged and n_in_batch > 0:
+            # Một forward cho cả batch (merged graph) — nhanh hơn rất nhiều so với từng user
+            logits = base_model.forward_merged_graph(batch_users, n_neighbors)
+            loss = criterion(logits, labels_t)
+            loss.backward()
             total_loss += loss.item()
-            n_users_processed += 1
+            n_users_processed += n_in_batch
             with torch.inference_mode():
-                p = torch.softmax(logits, dim=1)[0, 1].detach().cpu().numpy().item()
-            batch_probs.append(p)
+                probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+            all_preds.append(probs.astype(np.float32))
+            all_labels.append(batch_labels)
             del logits, loss
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+        else:
+            # Gradient accumulation: từng user forward/backward (tránh OOM khi không dùng merged)
+            batch_probs = []
+            batch_labels_list = []
+            for user_idx in batch_indices:
+                user_data = dataset.users[user_idx]
+                base_model.reset_state()
+                logits = model(user_data, n_neighbors)
+                batch_labels_list.append(user_data.label)
+                loss = criterion(logits, torch.tensor([user_data.label], dtype=torch.long, device=device))
+                (loss / n_in_batch).backward()
+                base_model.detach_memory()
+                total_loss += loss.item()
+                n_users_processed += 1
+                with torch.inference_mode():
+                    p = torch.softmax(logits, dim=1)[0, 1].detach().cpu().numpy().item()
+                batch_probs.append(p)
+                del logits, loss
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            if batch_probs:
+                all_preds.append(np.array(batch_probs, dtype=np.float32))
+                all_labels.append(np.array(batch_labels_list, dtype=np.int64))
+
         if device.type == "cuda":
             torch.cuda.empty_cache()
             gc.collect()
-        if batch_probs:
-            all_preds.append(np.array(batch_probs, dtype=np.float32))
-            all_labels.append(np.array(batch_labels_list, dtype=np.int64))
-        
         optimizer.step()
 
         if ((batch_start // user_batch_size) + 1) % 100 == 0:
@@ -399,6 +415,20 @@ def main_worker(args, device: Optional[torch.device] = None):
             f"Gợi ý: --user_batch_size {suggested} nếu CPU 100%% hoặc VRAM tăng (hiện tại {user_batch_size})."
         )
 
+    use_batch_forward = getattr(args, "use_batch_forward", False)
+    max_conv = getattr(args, "max_conversations_per_user", 80)
+    if use_batch_forward and getattr(model.module if hasattr(model, 'module') else model, 'sequence_mode', None) == 'lstm':
+        logger.info(
+            "use_batch_forward=True: training với merged graph (1 forward/batch) — nhanh hơn nhiều. "
+            "Logic tương đương từng user khi participants mỗi target không trùng nhau (xem doc forward_merged_graph)."
+        )
+    elif use_batch_forward:
+        logger.info("use_batch_forward chỉ có hiệu lực với --sequence_mode lstm (đang bỏ qua).")
+    if avg_conv > 30 and max_conv not in (-1, None) and max_conv > 30:
+        logger.info(
+            f"Gợi ý tốc độ: --max_conversations_per_user 20 hoặc 30 (hiện tại {max_conv}) "
+            "để train nhanh hơn nếu vẫn chậm."
+        )
     logger.info("Starting training...")
     best_val_auc = 0.0
     best_epoch = 0
@@ -414,6 +444,7 @@ def main_worker(args, device: Optional[torch.device] = None):
             device=device,
             n_neighbors=args.n_neighbors,
             user_batch_size=user_batch_size,
+            use_batch_forward=getattr(args, "use_batch_forward", False),
         )
         train_time = time.time() - train_start
 
@@ -599,6 +630,8 @@ if __name__ == "__main__":
                         help='GPU index')
     parser.add_argument('--user_batch_size', type=int, default=4,
                         help='Số lượng user xử lý trước mỗi lần optimizer.step(). Tăng 8-16 nếu đủ VRAM để train nhanh hơn.')
+    parser.add_argument('--use_batch_forward', action='store_true',
+                        help='LSTM only: 1 forward merged graph cho cả batch user (nhanh hơn nhiều, nên bật khi data lớn).')
     parser.add_argument('--eval_batch_size', type=int, default=8,
                         help='Số user gom một lần khi evaluate (LSTM mode). Tăng để val nhanh hơn.')
     parser.add_argument('--use_carryover_grad', action='store_true', default=True,
