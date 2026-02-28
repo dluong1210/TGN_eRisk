@@ -1,15 +1,8 @@
 """
 Data loading utilities for TGN Depression Detection.
 
-Data format (option 1 - CSV + JSON):
-- CSV file: userID, parentID, timestamp, post_id, conversation_id
-- JSON embeddings: {"target_user_id": {"post_id": [embedding_vector]}}
-- JSON labels: {"target_user_id": 0 or 1}
-
-Data format (option 2 - Parquet folders):
-- data_dir/neg/  (label 0) và data_dir/pos/  (label 1)
-- Mỗi folder chứa các file .parquet, tên file = target user id
-- Mỗi parquet: userID, parentID, timestamp, post_id, conversation_id, embedding
+Supports: Parquet folders (data_dir/neg/, data_dir/pos/, one .parquet per target user);
+create_dummy_data() for testing.
 """
 
 import numpy as np
@@ -101,278 +94,6 @@ def _stratified_split(
     rng.shuffle(train_idx)
     rng.shuffle(rest_idx)
     return np.array(train_idx), np.array(rest_idx)
-
-
-def load_depression_data(
-    interactions_path: str,
-    embeddings_path: str,
-    labels_path: str,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
-    split_method: str = "stratified",
-    seed: int = 42
-) -> Tuple[DepressionDataset, DepressionDataset, DepressionDataset, Dict]:
-    """
-    Load and split depression detection data.
-    
-    Target users are INDEPENDENT: mỗi target_user có chuỗi conversations riêng,
-    trong đó họ tương tác với các user khác trên social (không phải target_user
-    tương tác với nhau). Split train/val/test là random (stratified theo label).
-    
-    Args:
-        interactions_path: Path to CSV file
-            Columns: userID, parentID, timestamp, post_id, conversation_id
-        embeddings_path: Path to JSON file
-            Format: {"target_user_id": {"post_id": [embedding_vector]}}
-        labels_path: Path to JSON file
-            Format: {"target_user_id": 0 or 1}
-        val_ratio: Ratio of data for validation
-        test_ratio: Ratio of data for testing
-        split_method: 'stratified' (giữ tỉ lệ label) hoặc 'random'
-        seed: Random seed cho split
-    
-    Returns:
-        train_dataset, val_dataset, test_dataset, metadata
-    """
-    print("Loading data...")
-    
-    # Load JSON labels first (để biết target users, tránh load data thừa)
-    with open(labels_path, 'r') as f:
-        labels_data = json.load(f)
-    print(f"  Loaded labels for {len(labels_data)} target users")
-    target_user_str_set = {str(u) for u in labels_data.keys()}
-    
-    # Load CSV interactions
-    interactions_df = pd.read_csv(interactions_path)
-    print(f"  Loaded {len(interactions_df)} interactions from CSV")
-    
-    # Chỉ giữ conversations có ít nhất một target user (tránh load conversations không dùng tới)
-    conv_id_to_users = defaultdict(set)
-    for _, row in interactions_df.iterrows():
-        uid = str(row["userID"])
-        pid = row["parentID"]
-        conv_id = str(row["conversation_id"])
-        conv_id_to_users[conv_id].add(uid)
-        if pd.notna(pid):
-            conv_id_to_users[conv_id].add(str(pid))
-    needed_conv_ids = {
-        cid for cid, users in conv_id_to_users.items()
-        if users & target_user_str_set
-    }
-    interactions_df = interactions_df[
-        interactions_df["conversation_id"].astype(str).isin(needed_conv_ids)
-    ].copy()
-    print(f"  Kept {len(interactions_df)} interactions in {len(needed_conv_ids)} conversations (with ≥1 target user)")
-    
-    # Load JSON embeddings (chỉ target users)
-    with open(embeddings_path, 'r') as f:
-        embeddings_data = json.load(f)
-    print(f"  Loaded embeddings for {len(embeddings_data)} target users")
-    
-    # Users: chỉ từ interactions đã lọc + target users từ labels
-    all_users = set(interactions_df['userID'].astype(str))
-    parent_users = interactions_df['parentID'].dropna().astype(str)
-    all_users.update(parent_users)
-    all_users |= target_user_str_set
-    
-    user_to_idx = {user: idx for idx, user in enumerate(sorted(all_users))}
-    idx_to_user = {idx: user for user, idx in user_to_idx.items()}
-    n_total_users = len(user_to_idx)
-    print(f"  Found {n_total_users} unique users (only in needed conversations)")
-    
-    # Post IDs: chỉ từ embeddings (target users) + interactions đã lọc
-    all_post_ids = set()
-    for target_user, posts in embeddings_data.items():
-        all_post_ids.update(str(pid) for pid in posts.keys())
-    all_post_ids.update(interactions_df['post_id'].astype(str).unique())
-    
-    # Create post_id mapping
-    post_id_to_idx = {str(pid): idx for idx, pid in enumerate(sorted(all_post_ids))}
-    idx_to_post_id = {idx: pid for pid, idx in post_id_to_idx.items()}
-    n_posts = len(post_id_to_idx)
-    
-    # Determine embedding dimension
-    embedding_dim = None
-    for target_user, posts in embeddings_data.items():
-        for post_id, emb in posts.items():
-            embedding_dim = len(emb)
-            break
-        if embedding_dim:
-            break
-    
-    if embedding_dim is None:
-        embedding_dim = 768  # Default BERT dimension
-        print(f"  Warning: No embeddings found, using default dim {embedding_dim}")
-    
-    print(f"  Embedding dimension: {embedding_dim}")
-    print(f"  Total posts: {n_posts}")
-    
-    # Create embedding matrix
-    post_embeddings = np.zeros((n_posts, embedding_dim), dtype=np.float32)
-    
-    # Fill in embeddings from JSON
-    for target_user, posts in embeddings_data.items():
-        for post_id, emb in posts.items():
-            post_id_str = str(post_id)
-            if post_id_str in post_id_to_idx:
-                post_embeddings[post_id_to_idx[post_id_str]] = np.array(emb)
-    
-    # Count how many posts have embeddings
-    n_with_embeddings = np.sum(np.any(post_embeddings != 0, axis=1))
-    print(f"  Posts with embeddings: {n_with_embeddings}/{n_posts}")
-    
-    # Group interactions by conversation
-    conversations_dict = defaultdict(list)
-    
-    for _, row in interactions_df.iterrows():
-        conv_id = str(row['conversation_id'])
-        user_id = str(row['userID'])
-        parent_id = row['parentID']
-        
-        # Skip if parent is NaN (root post - no reply relationship)
-        if pd.isna(parent_id):
-            continue
-        
-        parent_id = str(parent_id)
-        post_id = str(row['post_id'])
-        timestamp = float(row['timestamp'])
-        
-        # Only add if both users exist in mapping
-        if user_id in user_to_idx and parent_id in user_to_idx:
-            conversations_dict[conv_id].append({
-                'source': user_to_idx[user_id],      # User who replied
-                'dest': user_to_idx[parent_id],      # User being replied to
-                'timestamp': timestamp,
-                'post_id': post_id_to_idx.get(post_id, 0)  # Map to embedding index
-            })
-    
-    # Create Conversation objects
-    all_conversations = {}
-    for conv_id, interactions in conversations_dict.items():
-        if len(interactions) == 0:
-            continue
-        
-        # Sort by timestamp
-        interactions = sorted(interactions, key=lambda x: x['timestamp'])
-        
-        conv = Conversation(
-            conversation_id=conv_id,
-            source_users=np.array([i['source'] for i in interactions]),
-            dest_users=np.array([i['dest'] for i in interactions]),
-            timestamps=np.array([i['timestamp'] for i in interactions], dtype=np.float64),
-            post_ids=np.array([i['post_id'] for i in interactions], dtype=np.int64)
-        )
-        all_conversations[conv_id] = conv
-    
-    print(f"  Created {len(all_conversations)} conversations")
-    
-    # Group conversations by TARGET USER
-    user_conversations = defaultdict(list)
-    
-    for conv_id, conv in all_conversations.items():
-        # Add conversation to all target users who participate in it
-        for user_idx in conv.unique_users:
-            user_str = idx_to_user[user_idx]
-            if user_str in labels_data:
-                user_conversations[user_idx].append(conv)
-    
-    # Create UserData objects for target users
-    all_user_data = []
-    for target_user_str, label in labels_data.items():
-        if target_user_str not in user_to_idx:
-            print(f"  Warning: Target user {target_user_str} not found in interactions")
-            continue
-        
-        user_idx = user_to_idx[target_user_str]
-        convs = user_conversations.get(user_idx, [])
-        # IMPORTANT: Do NOT sort conversations here.
-        # The conversation sequence is assumed to follow the order in the input data.
-        
-        user_data = UserData(
-            user_id=user_idx,
-            user_id_str=target_user_str,
-            conversations=convs,
-            label=int(label)
-        )
-        all_user_data.append(user_data)
-    
-    print(f"  Created {len(all_user_data)} target user samples")
-    
-    # Print some statistics
-    users_with_convs = sum(1 for u in all_user_data if u.n_conversations > 0)
-    total_convs = sum(u.n_conversations for u in all_user_data)
-    total_interactions = sum(u.total_interactions for u in all_user_data)
-    
-    print(f"  Users with conversations: {users_with_convs}/{len(all_user_data)}")
-    print(f"  Total conversations (assigned): {total_convs}")
-    print(f"  Total interactions: {total_interactions}")
-    
-    # Split data: RANDOM (stratified by label), không chronological
-    # Target users độc lập, không cần split theo thời gian
-    n_total = len(all_user_data)
-    n_test = int(n_total * test_ratio)
-    n_val = int(n_total * val_ratio)
-    n_train = n_total - n_val - n_test
-    
-    rng = np.random.RandomState(seed)
-    
-    if split_method == "stratified":
-        # Stratified split: giữ tỉ lệ depression/non-depression trong mỗi split
-        labels_arr = np.array([u.label for u in all_user_data])
-        indices = np.arange(n_total)
-        
-        train_idx, temp_idx = _stratified_split(indices, labels_arr, n_train / n_total, rng)
-        val_idx, test_idx = _stratified_split(temp_idx, labels_arr[temp_idx], n_val / len(temp_idx), rng)
-        
-        train_users = [all_user_data[i] for i in train_idx]
-        val_users = [all_user_data[i] for i in val_idx]
-        test_users = [all_user_data[i] for i in test_idx]
-    else:
-        # Random split
-        perm = rng.permutation(n_total)
-        train_users = [all_user_data[i] for i in perm[:n_train]]
-        val_users = [all_user_data[i] for i in perm[n_train:n_train + n_val]]
-        test_users = [all_user_data[i] for i in perm[n_train + n_val:]]
-    
-    print(f"  Split ({split_method}): {len(train_users)} train, {len(val_users)} val, {len(test_users)} test users")
-    
-    # Create datasets
-    train_dataset = DepressionDataset(
-        users=train_users,
-        post_embeddings=post_embeddings,
-        n_total_users=n_total_users,
-        user_to_idx=user_to_idx,
-        idx_to_user=idx_to_user
-    )
-    
-    val_dataset = DepressionDataset(
-        users=val_users,
-        post_embeddings=post_embeddings,
-        n_total_users=n_total_users,
-        user_to_idx=user_to_idx,
-        idx_to_user=idx_to_user
-    )
-    
-    test_dataset = DepressionDataset(
-        users=test_users,
-        post_embeddings=post_embeddings,
-        n_total_users=n_total_users,
-        user_to_idx=user_to_idx,
-        idx_to_user=idx_to_user
-    )
-    
-    metadata = {
-        'n_total_users': n_total_users,
-        'n_target_users': len(all_user_data),
-        'n_posts': n_posts,
-        'embedding_dim': embedding_dim,
-        'user_to_idx': user_to_idx,
-        'idx_to_user': idx_to_user,
-        'post_id_to_idx': post_id_to_idx,
-        'idx_to_post_id': idx_to_post_id
-    }
-    
-    return train_dataset, val_dataset, test_dataset, metadata
 
 
 def load_depression_data_from_parquet_folders(
@@ -767,14 +488,12 @@ def create_dummy_data(
     
     post_embeddings = np.array(all_post_embeddings, dtype=np.float32)
     print(f"  Generated {len(all_conversations)} conversations with {len(post_embeddings)} posts")
-    
+
     # Create UserData objects
     all_user_data = []
     for user_idx, label in target_labels.items():
         convs = user_to_conversations.get(user_idx, [])
-        # IMPORTANT: Do NOT sort conversations here.
-        # The conversation sequence is assumed to follow the generation / input order.
-        
+
         user_data = UserData(
             user_id=user_idx,
             user_id_str=idx_to_user[user_idx],
@@ -782,10 +501,9 @@ def create_dummy_data(
             label=label
         )
         all_user_data.append(user_data)
-    
-    # Conversations của mỗi user đã sort theo time (trong UserData)
+
     print(f"  Created {len(all_user_data)} target user samples")
-    
+
     # Save if requested
     if save_dir:
         save_dir = Path(save_dir)
