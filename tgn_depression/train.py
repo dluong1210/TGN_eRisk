@@ -16,6 +16,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import wandb
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -322,6 +323,15 @@ def main_worker(args, device=None):
     if rank == 0:
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
+    use_wandb = getattr(args, "use_wandb", False) and rank == 0
+    if use_wandb:
+        wandb.init(
+            project=getattr(args, "wandb_project", "tgn-erisk"),
+            name=getattr(args, "wandb_run_name", None),
+            config=vars(args),
+            dir=args.log_dir,
+        )
+
     logger.info("Loading data...")
     if args.use_dummy_data:
         train_dataset, val_dataset, test_dataset, metadata = create_dummy_data(
@@ -439,6 +449,20 @@ def main_worker(args, device=None):
             logger.info(f"  Train Loss: {train_loss:.4f}, Metrics: {train_metrics}")
             logger.info(f"  Val Loss: {val_loss:.4f}, Metrics: {val_metrics}")
 
+            if use_wandb:
+                log_dict = {
+                    "epoch": epoch + 1,
+                    "train/loss": train_loss,
+                    "val/loss": val_loss,
+                    "val/auc": val_auc,
+                    "epoch_time_sec": epoch_time,
+                }
+                for k, v in train_metrics.items():
+                    log_dict[f"train/{k}"] = v
+                for k, v in val_metrics.items():
+                    log_dict[f"val/{k}"] = v
+                wandb.log(log_dict)
+
         scheduler.step(val_auc)
 
         if val_auc > best_val_auc:
@@ -465,6 +489,10 @@ def main_worker(args, device=None):
         with open(f"{args.save_dir}/results.json", "w") as f:
             json.dump(results, f, indent=2)
         logger.info(f"Results saved to {args.save_dir}/results.json")
+        if use_wandb:
+            wandb.run.summary["best_epoch"] = best_epoch
+            wandb.run.summary["best_val_auc"] = best_val_auc
+            wandb.finish()
     if is_distributed:
         dist.destroy_process_group()
 
@@ -516,6 +544,10 @@ def main():
 
     parser.add_argument("--save_dir", type=str, default="./saved_models")
     parser.add_argument("--log_dir", type=str, default="./logs")
+
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="tgn-erisk", help="W&B project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name (optional)")
 
     args = parser.parse_args()
     main_worker(args)
