@@ -1,4 +1,4 @@
 try:
-    from .tgn_sequential import TGNSequential, TGNCarryOver, TGNLstm
+    from .tgn_user_sequence import TGNUserSequence
 except ImportError:
-    from model.tgn_sequential import TGNSequential, TGNCarryOver, TGNLstm
+    from model.tgn_user_sequence import TGNUserSequence

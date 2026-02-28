@@ -119,4 +119,16 @@ class Memory(nn.Module):
     def reset_state(self):
         self.__init_memory__()
 
+    def free_nodes_except(self, keep_node: int):
+        """
+        Xóa memory của mọi node trừ keep_node.
+        Tối ưu bộ nhớ: other users không xuất hiện ở conversation sau.
+        """
+        nodes_to_remove = [n for n in list(self._memory.keys()) if n != keep_node]
+        for n in nodes_to_remove:
+            del self._memory[n]
+            if n in self._last_update:
+                del self._last_update[n]
+        self.messages.clear()
+
 
