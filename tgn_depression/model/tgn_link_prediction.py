@@ -140,10 +140,12 @@ class TGNLinkPrediction(nn.Module):
         if len(unique_nodes) == 0:
             return full_memory, full_ts
         unique_messages = self.message_function.compute_message(unique_messages)
-        updated_memory, updated_ts = self.memory_updater.get_updated_memory(
+        filtered_nodes, updated_memory, updated_ts = self.memory_updater.get_updated_memory(
             unique_nodes, unique_messages, timestamps=unique_timestamps
         )
-        idx = torch.tensor(unique_nodes, device=self.device, dtype=torch.long)
+        if len(filtered_nodes) == 0:
+            return full_memory, full_ts
+        idx = torch.tensor(filtered_nodes, device=self.device, dtype=torch.long)
         full_memory[idx] = updated_memory
         full_ts[idx] = updated_ts.squeeze()
         return full_memory, full_ts

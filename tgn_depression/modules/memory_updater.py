@@ -125,31 +125,21 @@ class SequenceMemoryUpdater(MemoryUpdater):
         unique_node_ids: List[int],
         unique_messages: torch.Tensor,
         timestamps: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get updated memory without persisting (legacy full-buffer path)."""
+    ) -> Tuple[List[int], torch.Tensor, torch.Tensor]:
+        """Get updated memory without persisting. Returns (filtered_node_ids, updated_memory, updated_timestamps)."""
         if len(unique_node_ids) == 0:
-            return (
-                torch.zeros(0, self.memory.memory_dimension, device=self.memory.device),
-                torch.zeros(0, device=self.memory.device),
-            )
-            
-        # # Verify temporal consistency
-        # assert (self.memory.get_last_update(unique_node_ids) <= timestamps).all().item(), \
-        #     "Trying to update memory to time in the past"
+            return [], torch.zeros(0, self.memory.memory_dimension, device=self.memory.device), torch.zeros(0, device=self.memory.device)
         last_updates = self.memory.get_last_update(unique_node_ids)
         valid = (last_updates <= timestamps)
         if not valid.any().item():
-            return (
-                torch.zeros(0, self.memory.memory_dimension, device=self.memory.device),
-                torch.zeros(0, device=self.memory.device),
-            )
+            return [], torch.zeros(0, self.memory.memory_dimension, device=self.memory.device), torch.zeros(0, device=self.memory.device)
         valid_idx = valid.nonzero(as_tuple=True)[0]
-        unique_node_ids = [unique_node_ids[i] for i in valid_idx.tolist()]
+        filtered_node_ids = [unique_node_ids[i] for i in valid_idx.tolist()]
         unique_messages = unique_messages[valid_idx]
         timestamps = timestamps[valid_idx]
-        current_memory = self.memory.get_memory(unique_node_ids)
+        current_memory = self.memory.get_memory(filtered_node_ids)
         new_memory = self.memory_updater(unique_messages, current_memory)
-        return new_memory, timestamps
+        return filtered_node_ids, new_memory, timestamps
 
     def get_updated_memory_rows_only(
         self,
@@ -158,7 +148,8 @@ class SequenceMemoryUpdater(MemoryUpdater):
         timestamps: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Chỉ trả về memory đã update cho các node (không clone full buffer) — tránh OOM."""
-        return self.get_updated_memory(unique_node_ids, unique_messages, timestamps)
+        _, updated_memory, updated_ts = self.get_updated_memory(unique_node_ids, unique_messages, timestamps)
+        return updated_memory, updated_ts
 
 
 class GRUMemoryUpdater(SequenceMemoryUpdater):
