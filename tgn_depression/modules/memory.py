@@ -1,8 +1,9 @@
 """
 Node memory module.
 
-Chỉ lưu memory cho các node đã được cập nhật (node trong L-hop ego),
-không cấp phát full buffer (n_nodes, dim) → giảm VRAM khi n_nodes lớn.
+Uses a full buffer [n_nodes, dim] so that gradients flow from the classification
+loss back to the memory updater (GRU). Updates use truncated BPTT:
+buffer = buffer.detach().clone(); buffer[ids] = values.
 """
 
 import torch
@@ -15,7 +16,8 @@ import numpy as np
 
 class Memory(nn.Module):
     """
-    Node memory module — sparse: chỉ lưu các node đã update (ego), không full graph.
+    Node memory module — full buffer so embedding(memory) is differentiable.
+    TGN gốc: loss -> embedding(memory) -> memory -> memory_updater (GRU).
     """
 
     def __init__(self,
@@ -26,42 +28,49 @@ class Memory(nn.Module):
         self.n_nodes = n_nodes
         self.memory_dimension = memory_dimension
         self.device = device
+        self.register_buffer(
+            "memory_buffer",
+            torch.zeros(n_nodes, memory_dimension, device=device, dtype=torch.float32),
+        )
         self.__init_memory__()
 
     def __init_memory__(self):
-        # Sparse: chỉ lưu node đã được update (trong ego), không cấp phát (n_nodes, dim)
-        self._memory: Dict[int, torch.Tensor] = {}
         self._last_update: Dict[int, torch.Tensor] = {}
         self.messages: Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]] = defaultdict(list)
 
     @property
     def memory(self) -> torch.Tensor:
-        """Compat: code cũ có thể đọc .memory; trả về tensor ảo (0, dim) để không vỡ."""
-        if not hasattr(self, '_dummy_memory') or self._dummy_memory.shape[1] != self.memory_dimension:
-            self.register_buffer('_dummy_memory', torch.zeros(0, self.memory_dimension, device=self.device))
-        return self._dummy_memory
+        """Compat: code cũ có thể đọc .memory; trả về buffer."""
+        return self.memory_buffer
 
     def _zero_row(self) -> torch.Tensor:
         return torch.zeros(1, self.memory_dimension, device=self.device, dtype=torch.float32).squeeze(0)
 
     def get_memory(self, node_idxs: Union[List[int], np.ndarray, torch.Tensor]) -> torch.Tensor:
-        """Trả về [len(node_idxs), memory_dim]; node chưa có thì trả về 0."""
+        """Trả về [len(node_idxs), memory_dim]; slice từ buffer để giữ computation graph."""
         if hasattr(node_idxs, '__len__') and len(node_idxs) == 0:
             return torch.zeros(0, self.memory_dimension, device=self.device, dtype=torch.float32)
-        idx = np.asarray(node_idxs).flatten()
-        out = torch.zeros(len(idx), self.memory_dimension, device=self.device, dtype=torch.float32)
-        for i in range(len(idx)):
-            nid = int(idx[i])
-            if nid in self._memory:
-                out[i] = self._memory[nid]
-        return out
+        idx = torch.as_tensor(
+            np.asarray(node_idxs).flatten(), device=self.memory_buffer.device, dtype=torch.long
+        )
+        return self.memory_buffer[idx]
 
     def set_memory(self, node_idxs: Union[List[int], np.ndarray], values: torch.Tensor):
-        """Chỉ lưu các hàng tương ứng node_idxs."""
-        idx = np.asarray(node_idxs).flatten()
-        for i in range(len(idx)):
-            nid = int(idx[i])
-            self._memory[nid] = values[i]
+        """
+        Cập nhật buffer có đạo hàm: new = old.detach() * (1 - mask) + scatter(values at ids).
+        Truncated BPTT: old bị detach; gradient chỉ chảy qua values (GRU output).
+        """
+        idx = torch.as_tensor(
+            np.asarray(node_idxs).flatten(), device=self.memory_buffer.device, dtype=torch.long
+        )
+        old = self.memory_buffer.detach().clone()
+        # scatter: tensor bằng 0 ngoài ids, bằng values tại ids
+        scatter = torch.zeros_like(old)
+        scatter[idx] = values
+        # mask: 1 tại ids để thay thế
+        mask = torch.zeros(old.shape[0], 1, device=old.device, dtype=old.dtype)
+        mask[idx] = 1.0
+        self.memory_buffer = old * (1.0 - mask) + scatter
 
     def get_last_update(self, node_idxs: Union[List[int], np.ndarray, torch.Tensor]) -> torch.Tensor:
         """Trả về last_update cho từng node; chưa có thì 0."""
@@ -95,40 +104,62 @@ class Memory(nn.Module):
         for node in nodes:
             self.messages[node] = []
 
-    def backup_memory(self) -> Tuple[Dict, Dict, Dict]:
-        """Backup sparse state."""
-        mem_clone = {k: v.clone() for k, v in self._memory.items()}
-        last_clone = {k: v.clone() if isinstance(v, torch.Tensor) else torch.tensor(v, device=self.device) for k, v in self._last_update.items()}
+    def backup_memory(self) -> Tuple[torch.Tensor, Dict, Dict]:
+        """Backup buffer and ephemeral state."""
+        mem_clone = self.memory_buffer.clone()
+        last_clone = {
+            k: v.clone() if isinstance(v, torch.Tensor) else torch.tensor(v, device=self.device)
+            for k, v in self._last_update.items()
+        }
         msg_clone = {}
         for k, v in self.messages.items():
             msg_clone[k] = [(x[0].clone(), x[1].clone()) for x in v]
         return (mem_clone, last_clone, msg_clone)
 
-    def restore_memory(self, backup: Tuple[Dict, Dict, Dict]):
-        self._memory = {k: v.clone() for k, v in backup[0].items()}
-        self._last_update = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in backup[1].items()}
+    def restore_memory(self, backup: Tuple[torch.Tensor, Dict, Dict]):
+        self.memory_buffer.copy_(backup[0])
+        self._last_update = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in backup[1].items()
+        }
         self.messages = defaultdict(list)
         for k, v in backup[2].items():
             self.messages[k] = [(x[0].clone(), x[1].clone()) for x in v]
 
     def detach_memory(self):
-        self._memory = {k: v.detach() for k, v in self._memory.items()}
-        self._last_update = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in self._last_update.items()}
+        if self.memory_buffer.requires_grad:
+            self.memory_buffer.detach_()
+        self._last_update = {
+            k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in self._last_update.items()
+        }
         self.messages = defaultdict(list)
 
     def reset_state(self):
+        # Tạo buffer mới hoàn toàn, KHÔNG tham chiếu buffer cũ. Sau backward() PyTorch
+        # có thể đã free buffer cũ; dùng zeros_like/detach vẫn truy cập nó → lỗi.
+        dev = self.memory_buffer.device  # chỉ đọc .device, không đụng storage
+        self.memory_buffer = torch.zeros(
+            self.n_nodes, self.memory_dimension,
+            device=dev, dtype=torch.float32,
+        )
         self.__init_memory__()
+
+    def get_full_memory_tensor(self) -> torch.Tensor:
+        """Return the full memory buffer for embedding module (same tensor, gradient flows)."""
+        return self.memory_buffer
 
     def free_nodes_except(self, keep_node: int):
         """
-        Xóa memory của mọi node trừ keep_node.
-        Tối ưu bộ nhớ: other users không xuất hiện ở conversation sau.
+        Giữ memory của keep_node, zero các node khác (sau mỗi conversation).
+        Dùng mask nhân (không detach) để gradient vẫn chảy qua keep_node → model có thể học.
+        Trước đây detach khiến buffer mất grad → embedding không có gradient khi conv cuối
+        không update target_user, hoặc gradient bị cắt quá sớm.
         """
-        nodes_to_remove = [n for n in list(self._memory.keys()) if n != keep_node]
+        mask = torch.zeros(
+            self.n_nodes, 1, device=self.memory_buffer.device, dtype=self.memory_buffer.dtype
+        )
+        mask[keep_node, 0] = 1.0
+        self.memory_buffer = self.memory_buffer * mask
+        nodes_to_remove = [n for n in list(self._last_update.keys()) if n != keep_node]
         for n in nodes_to_remove:
-            del self._memory[n]
-            if n in self._last_update:
-                del self._last_update[n]
+            del self._last_update[n]
         self.messages.clear()
-
-

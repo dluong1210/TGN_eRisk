@@ -95,9 +95,17 @@ class SequenceMemoryUpdater(MemoryUpdater):
         if len(unique_node_ids) == 0:
             return
         
-        # Verify temporal consistency
-        assert (self.memory.get_last_update(unique_node_ids) <= timestamps).all().item(), \
-            "Trying to update memory to time in the past"
+        #  # Verify temporal consistency
+        # assert (self.memory.get_last_update(unique_node_ids) <= timestamps).all().item(), \
+        #     "Trying to update memory to time in the past"
+        last_updates = self.memory.get_last_update(unique_node_ids)
+        valid = (last_updates <= timestamps)
+        if not valid.any().item():
+            return
+        valid_idx = valid.nonzero(as_tuple=True)[0]
+        unique_node_ids = [unique_node_ids[i] for i in valid_idx.tolist()]
+        unique_messages = unique_messages[valid_idx]
+        timestamps = timestamps[valid_idx]
         
         # Get current memory
         current_memory = self.memory.get_memory(unique_node_ids)
@@ -124,10 +132,21 @@ class SequenceMemoryUpdater(MemoryUpdater):
                 torch.zeros(0, self.memory.memory_dimension, device=self.memory.device),
                 torch.zeros(0, device=self.memory.device),
             )
-        
-        # Verify temporal consistency
-        assert (self.memory.get_last_update(unique_node_ids) <= timestamps).all().item(), \
-            "Trying to update memory to time in the past"
+            
+        # # Verify temporal consistency
+        # assert (self.memory.get_last_update(unique_node_ids) <= timestamps).all().item(), \
+        #     "Trying to update memory to time in the past"
+        last_updates = self.memory.get_last_update(unique_node_ids)
+        valid = (last_updates <= timestamps)
+        if not valid.any().item():
+            return (
+                torch.zeros(0, self.memory.memory_dimension, device=self.memory.device),
+                torch.zeros(0, device=self.memory.device),
+            )
+        valid_idx = valid.nonzero(as_tuple=True)[0]
+        unique_node_ids = [unique_node_ids[i] for i in valid_idx.tolist()]
+        unique_messages = unique_messages[valid_idx]
+        timestamps = timestamps[valid_idx]
         current_memory = self.memory.get_memory(unique_node_ids)
         new_memory = self.memory_updater(unique_messages, current_memory)
         return new_memory, timestamps

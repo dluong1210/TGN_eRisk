@@ -139,6 +139,23 @@ class MergeLayer(nn.Module):
         return self.fc2(h)
 
 
+class MergeLayer(nn.Module):
+    """MLP để tính affinity score từ 2 embedding (link prediction, giống TGN gốc)."""
+
+    def __init__(self, dim1: int, dim2: int, dim3: int, dim4: int):
+        super().__init__()
+        self.fc1 = nn.Linear(dim1 + dim2, dim3)
+        self.fc2 = nn.Linear(dim3, dim4)
+        self.act = nn.ReLU()
+        nn.init.xavier_normal_(self.fc1.weight)
+        nn.init.xavier_normal_(self.fc2.weight)
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([x1, x2], dim=-1)
+        h = self.act(self.fc1(x))
+        return self.fc2(h)
+
+
 class ClassificationHead(nn.Module):
     """
     Classification head for depression detection.
